@@ -4,8 +4,14 @@
 import argparse
 import io
 import os
+import sys
 import tempfile
 from datetime import timedelta
+from pathlib import Path
+
+# Add powerdata to path for powerformer_hf
+_powerdata_dir = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(_powerdata_dir))
 
 import torch
 import torch.serialization
@@ -13,6 +19,7 @@ from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa
+import powerformer_hf  # noqa - registers PowerFormer with Auto*
 from torchtitan.tools.logging import init_logger, logger
 
 

@@ -9,12 +9,19 @@ import os
 import time
 from datetime import timedelta
 
-import torch
-from datasets import interleave_datasets, load_dataset
-from torch.distributed.elastic.multiprocessing.errors import record
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+import sys
+from pathlib import Path
+
+# Add powerdata to path for powerformer_hf
+_powerdata_dir = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(_powerdata_dir))
 
 import fla  # noqa
+import powerformer_hf  # noqa - registers PowerFormer with Auto*
+import torch
+from datasets import interleave_datasets, load_dataset, load_from_disk
+from torch.distributed.elastic.multiprocessing.errors import record
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.common.utils import prepare_position_ids
 from flame.components.checkpoint import TrainState
@@ -155,21 +162,26 @@ def main(job_config: JobConfig):
 
     min_num_shards = dp_degree * job_config.training.num_workers
     if len(job_config.training.dataset.split(",")) == 1:
-        dataset = load_dataset(
-            path=job_config.training.dataset,
-            name=getattr(job_config.training, "dataset_name", None),
-            data_dir=getattr(job_config.training, "data_dir", None),
-            data_files=getattr(job_config.training, "data_files", None),
-            split=job_config.training.dataset_split or "train",
-            trust_remote_code=True,
-            streaming=job_config.training.streaming,
-            num_proc=(
-                job_config.training.num_workers
-                if not job_config.training.streaming
-                else None
-            ),
-        )
-        logger.info(f"{dataset}")
+        if job_config.training.dataset == "disk":
+            # Load dataset saved with save_to_disk()
+            dataset = load_from_disk(job_config.training.data_dir)
+            logger.info(f"Loaded dataset from disk: {dataset}")
+        else:
+            dataset = load_dataset(
+                path=job_config.training.dataset,
+                name=getattr(job_config.training, "dataset_name", None),
+                data_dir=getattr(job_config.training, "data_dir", None),
+                data_files=getattr(job_config.training, "data_files", None),
+                split=job_config.training.dataset_split or "train",
+                trust_remote_code=True,
+                streaming=job_config.training.streaming,
+                num_proc=(
+                    job_config.training.num_workers
+                    if not job_config.training.streaming
+                    else None
+                ),
+            )
+            logger.info(f"{dataset}")
 
         logger.info(f"Shuffling the dataset with seed {job_config.training.seed}")
         if not job_config.training.streaming:
@@ -451,6 +463,36 @@ def main(job_config: JobConfig):
         model.train()
 
         model_parts = [model]
+
+    # # === NaN detection hooks ===
+    # def make_nan_hook(name):
+    #     def nan_hook(module, input, output):
+    #         def check_tensor(t, desc):
+    #             if isinstance(t, torch.Tensor):
+    #                 if torch.isnan(t).any():
+    #                     logger.error(f"NaN in {desc} of {name} ({module.__class__.__name__})")
+    #                     logger.error(f"  shape: {t.shape}, dtype: {t.dtype}")
+    #                     nan_count = torch.isnan(t).sum().item()
+    #                     inf_count = torch.isinf(t).sum().item()
+    #                     logger.error(f"  nan_count: {nan_count}, inf_count: {inf_count}, numel: {t.numel()}")
+    #                     raise RuntimeError(f"NaN detected in {name}")
+            
+    #         if isinstance(output, torch.Tensor):
+    #             check_tensor(output, "output")
+    #         elif isinstance(output, (tuple, list)):
+    #             for i, o in enumerate(output):
+    #                 check_tensor(o, f"output[{i}]")
+            
+    #         if isinstance(input, tuple):
+    #             for i, inp in enumerate(input):
+    #                 check_tensor(inp, f"input[{i}]")
+    #     return nan_hook
+
+    # for m in model_parts:
+    #     for name, module in m.named_modules():
+    #         module.register_forward_hook(make_nan_hook(name))
+    # logger.info("Registered NaN detection hooks on all modules")
+    # # === End NaN detection hooks ===
 
     device_mem_stats = device_memory_monitor.get_peak_stats()
     logger.info(
