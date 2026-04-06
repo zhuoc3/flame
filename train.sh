@@ -66,7 +66,7 @@ steps=$(grep -oP '(?<=--training.steps )[^ ]+' <<< "$params")
 config=$(grep -oP '(?<=--model.config )[^ ]+' <<< "$params")
 tokenizer=$(grep -oP '(?<=--model.tokenizer_path )[^ ]+' <<< "$params")
 model=$(
-  python -c "import sys; sys.path.insert(0, '$(dirname $0)/..'); import fla, powerformer_hf; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
+  python -c "import sys; sys.path.insert(0, '$(dirname $0)/..'); import fla, powerformer_hf, powerssm; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
 )
 
 mkdir -p $path

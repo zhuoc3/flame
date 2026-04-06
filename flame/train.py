@@ -18,6 +18,7 @@ sys.path.insert(0, str(_powerdata_dir))
 
 import fla  # noqa
 import powerformer_hf  # noqa - registers PowerFormer with Auto*
+import powerssm  # noqa - registers PowerSSM with Auto*
 import torch
 from datasets import interleave_datasets, load_dataset, load_from_disk
 from torch.distributed.elastic.multiprocessing.errors import record
