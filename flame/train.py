@@ -544,6 +544,13 @@ def main(job_config: JobConfig):
         lr_schedulers  # Pass schedulers if needed by logger logic
     )
 
+    # Log model configuration to WandB
+    metric_logger.log_config({
+        "model/num_parameters": model_param_count,
+        "model/num_flops_per_token": num_flops_per_token,
+        "model/config": model_config.to_json_string() if hasattr(model_config, 'to_json_string') else str(model_config),
+    })
+
     # plot losses loaded from checkpoint (if any) to TensorBoard
     # NOTE: Loss info after the last log step before checkpoint saving will not be ploted.
     #       This can be avoided by setting checkpoint.interval to be a multiple of metrics.log_freq
