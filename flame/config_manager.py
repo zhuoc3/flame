@@ -322,6 +322,23 @@ class JobConfig:
             help="Data sampling probabilities, with comma separated values if provided",
         )
         self.parser.add_argument(
+            "--training.val_data_dir",
+            default=None,
+            help="Path to validation dataset on disk (saved via save_to_disk). When set, periodic validation is enabled.",
+        )
+        self.parser.add_argument(
+            "--training.val_interval",
+            type=int,
+            default=500,
+            help="Run validation every N training steps (only when val_data_dir is set)",
+        )
+        self.parser.add_argument(
+            "--training.val_batches",
+            type=int,
+            default=20,
+            help="Number of batches per validation evaluation",
+        )
+        self.parser.add_argument(
             "--training.streaming",
             action="store_true",
             help="Whether to load dataset in streaming mode, used for huge dataset",

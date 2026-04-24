@@ -363,6 +363,37 @@ def main(job_config: JobConfig):
         snapshot_every_n_steps=job_config.checkpoint.interval,
     )
 
+    # Validation dataloader (optional)
+    val_dataloader = None
+    val_data_dir = getattr(job_config.training, "val_data_dir", None)
+    if val_data_dir:
+        logger.info(f"Loading validation dataset from {val_data_dir}")
+        val_dataset = load_from_disk(val_data_dir)
+        logger.info(f"Validation dataset: {val_dataset}")
+        val_dataset = val_dataset.to_iterable_dataset(num_shards=max(1, dp_degree))
+        from flame.data import OnlineTokenizedIterableDataset, DataCollatorForLanguageModeling
+        val_tok_dataset = OnlineTokenizedIterableDataset(
+            dataset=val_dataset,
+            tokenizer=tokenizer,
+            seq_len=job_config.training.seq_len,
+            rank=dp_rank,
+            world_size=dp_degree,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_tok_dataset,
+            batch_size=job_config.training.batch_size,
+            collate_fn=DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                context_len=job_config.training.context_len,
+                varlen=job_config.training.varlen,
+            ),
+            num_workers=0,
+        )
+        logger.info(
+            f"Validation enabled: every {job_config.training.val_interval} steps, "
+            f"{job_config.training.val_batches} batches"
+        )
+
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
     # set the model configs from training inputs:
@@ -607,6 +638,61 @@ def main(job_config: JobConfig):
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
     )
 
+    # Validation evaluation function (works with FSDP/HSDP — model stays wrapped)
+    val_iterator = iter(val_dataloader) if val_dataloader is not None else None
+
+    def run_validation(step):
+        nonlocal val_iterator
+        if val_dataloader is None:
+            return
+        val_losses = []
+        val_tokens = 0
+        for m in model_parts:
+            m.eval()
+        with torch.no_grad():
+            for _ in range(job_config.training.val_batches):
+                try:
+                    batch = next(val_iterator)
+                except StopIteration:
+                    val_iterator = iter(val_dataloader)
+                    batch = next(val_iterator)
+                input_ids = batch["input_ids"].to(device_type)
+                labels = batch["labels"].to(device_type)
+                position_ids = (
+                    torch.arange(0, input_ids.shape[1], device=device_type)
+                    .repeat(input_ids.shape[0], 1)
+                    .to(torch.int32)
+                )
+                output = model_parts[0](
+                    input_ids=input_ids,
+                    labels=labels,
+                    position_ids=position_ids,
+                )
+                val_losses.append(output.loss.detach())
+                val_tokens += labels.numel()
+        for m in model_parts:
+            m.train()
+
+        avg_val_loss = torch.stack(val_losses).mean()
+        if (
+            parallel_dims.dp_replicate_enabled
+            or parallel_dims.dp_shard_enabled
+            or parallel_dims.cp_enabled
+        ):
+            avg_val_loss = dist_utils.dist_mean(avg_val_loss, world_mesh["dp_cp"])
+
+        if isinstance(avg_val_loss, torch.Tensor):
+            avg_val_loss = avg_val_loss.item()
+        val_ppl = 2.718281828 ** avg_val_loss
+        logger.info(
+            f"{color.cyan}[val] step {step}: loss={avg_val_loss:.4f} ppl={val_ppl:.2f} "
+            f"({val_tokens} tokens){color.reset}"
+        )
+        metric_logger.logger.log(
+            {"val/loss": avg_val_loss, "val/perplexity": val_ppl},
+            step,
+        )
+
     # SLURM-aware time-limit save: save a checkpoint and exit cleanly about
     # `slurm_time_limit_buffer_s` seconds before the allocation runs out, so
     # the next chain job can resume from the latest completed step instead of
@@ -809,6 +895,14 @@ def main(job_config: JobConfig):
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
+
+            # Periodic validation
+            val_interval = getattr(job_config.training, "val_interval", 500)
+            if (
+                val_dataloader is not None
+                and train_state.step % val_interval == 0
+            ):
+                run_validation(train_state.step)
 
             # Detect SLURM time-limit window; force a save now if we're inside
             # the buffer, then break out so the remaining chain-mates take over.
