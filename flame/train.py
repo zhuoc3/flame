@@ -717,8 +717,14 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            ga_steps = job_config.training.gradient_accumulation_steps
             # do gradient accumulation if enabled
-            for _ in range(job_config.training.gradient_accumulation_steps):
+            for ga_step in range(ga_steps):
+                # Skip redundant DDP all-reduce on non-final micro-batches.
+                # The final micro-batch syncs the accumulated gradients.
+                if parallel_dims.dp_replicate_enabled and ga_steps > 1:
+                    model.set_requires_gradient_sync(ga_step == ga_steps - 1)
+
                 # get batch
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
