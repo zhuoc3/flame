@@ -2,13 +2,20 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as DCP
 from transformers import AutoModelForCausalLM
 
+# Add powerdata to path for powerformer_hf / powerssm
+_powerdata_dir = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(_powerdata_dir))
+
 import fla  # noqa
+import powerformer_hf  # noqa - registers PowerFormer with Auto*
+import powerssm  # noqa - registers PowerSSM with Auto*
 from torchtitan.tools.logging import init_logger, logger
 
 

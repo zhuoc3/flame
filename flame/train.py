@@ -607,6 +607,15 @@ def main(job_config: JobConfig):
         f"{color.green}  Number of parameters = {model_param_count:,} {color.reset}"
     )
 
+    # SLURM-aware time-limit save: save a checkpoint and exit cleanly about
+    # `slurm_time_limit_buffer_s` seconds before the allocation runs out, so
+    # the next chain job can resume from the latest completed step instead of
+    # losing everything since the last `checkpoint.interval` save. Harmless
+    # when run outside SLURM (SLURM_JOB_END_TIME=0 → no-op).
+    slurm_end_time = int(os.environ.get("SLURM_JOB_END_TIME", "0"))
+    slurm_time_limit_buffer_s = int(os.environ.get("SLURM_TIME_LIMIT_BUFFER_S", "120"))
+    time_limit_triggered = False
+
     with (
         maybe_enable_profiling(
             job_config, global_step=train_state.step
@@ -801,9 +810,67 @@ def main(job_config: JobConfig):
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
 
+            # Detect SLURM time-limit window; force a save now if we're inside
+            # the buffer, then break out so the remaining chain-mates take over.
+            if slurm_end_time > 0 and time.time() > slurm_end_time - slurm_time_limit_buffer_s:
+                time_limit_triggered = True
+
             checkpoint.save(
-                train_state.step, force=(train_state.step == job_config.training.steps)
+                train_state.step,
+                force=(train_state.step == job_config.training.steps) or time_limit_triggered,
             )
+
+            # Model-only archive snapshot. Survives `keep_latest_k` purge so the
+            # full training trajectory (not just the last K steps) stays on
+            # disk. Archive cadence is set via env var FLAME_ARCHIVE_EVERY_STEPS
+            # (0 disables, default 5000). Saves model weights only in bfloat16
+            # to the `archive/step-N/` subdir of `job.dump_folder`. The main
+            # `checkpoint/` path continues to be the authoritative resume
+            # source — archive is read-only history for analysis.
+            _archive_every = int(os.environ.get("FLAME_ARCHIVE_EVERY_STEPS", "5000"))
+            _save_interval = job_config.checkpoint.interval
+            if (
+                _archive_every > 0
+                and train_state.step > 0
+                and (train_state.step % _archive_every == 0
+                     or train_state.step == job_config.training.steps)
+                and train_state.step % _save_interval == 0
+            ):
+                try:
+                    _archive_folder = os.path.join(
+                        job_config.job.dump_folder, "archive", f"step-{train_state.step}"
+                    )
+                    import torch.distributed.checkpoint as dcp
+                    from torchtitan.components.checkpoint import MODEL as _MODEL_KEY
+                    # Extract model state dict (FSDP-sharded DTensors under the
+                    # hood; dcp.save handles sharding). Cast floating-point
+                    # weights to bf16 to halve disk cost — archive is for
+                    # post-hoc analysis, not resume, so fp32 precision isn't
+                    # needed.
+                    _sd = checkpoint.states[_MODEL_KEY].state_dict()
+                    _sd.pop("freqs_cis", None)
+                    _sd = {
+                        k: (v.to(torch.bfloat16) if v.is_floating_point() else v)
+                        for k, v in _sd.items()
+                    }
+                    dcp.save(_sd, checkpoint_id=_archive_folder)
+                    if torch.distributed.get_rank() == 0:
+                        logger.info(
+                            f"Saved model-only bf16 archive at {_archive_folder}"
+                        )
+                except Exception as _e:
+                    if torch.distributed.get_rank() == 0:
+                        logger.warning(
+                            f"Archive save at step {train_state.step} failed: {_e}"
+                        )
+
+            if time_limit_triggered:
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        f"SLURM time limit within {slurm_time_limit_buffer_s}s — "
+                        f"saved checkpoint at step {train_state.step} and exiting cleanly for chain resume"
+                    )
+                break
 
             # signal the profiler that the next profiling step has started
             if torch_profiler:
@@ -818,6 +885,34 @@ def main(job_config: JobConfig):
                     timeout=timedelta(seconds=job_config.comm.train_timeout_seconds),
                     world_mesh=world_mesh,
                 )
+
+    # Training-done marker + chain-mate scancel. Mirrors the synthetic trainer's
+    # behavior: when the loop runs to completion (not broken out of for a
+    # time-limit save), rank 0 persists a TRAINING_DONE marker in the dump
+    # folder and cancels every PENDING sbatch job sharing this one's --job-name
+    # so the rest of the dependency chain doesn't just reload the final
+    # checkpoint and exit.
+    if (
+        not time_limit_triggered
+        and train_state.step >= job_config.training.steps
+        and torch.distributed.get_rank() == 0
+    ):
+        try:
+            done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
+            with open(done_path, "w") as f:
+                f.write(f"completed {train_state.step} steps at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+            logger.info(f"wrote TRAINING_DONE marker at {done_path}")
+            job_name = os.environ.get("SLURM_JOB_NAME")
+            user = os.environ.get("USER") or os.environ.get("LOGNAME")
+            if job_name and user:
+                import subprocess
+                logger.info(f"scancel --state=PENDING --name={job_name} --user={user}")
+                subprocess.run(
+                    ["scancel", "--state=PENDING", f"--name={job_name}", f"--user={user}"],
+                    check=False, timeout=30,
+                )
+        except Exception as e:
+            logger.warning(f"training-done cleanup failed: {e}")
 
     if torch.distributed.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")

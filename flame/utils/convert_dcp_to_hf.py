@@ -20,6 +20,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa
 import powerformer_hf  # noqa - registers PowerFormer with Auto*
+import powerssm  # noqa - registers PowerSSM with Auto*
 from torchtitan.tools.logging import init_logger, logger
 
 

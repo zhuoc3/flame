@@ -65,16 +65,31 @@ path=$(grep -oP '(?<=--job.dump_folder )[^ ]+' <<< "$params")
 steps=$(grep -oP '(?<=--training.steps )[^ ]+' <<< "$params")
 config=$(grep -oP '(?<=--model.config )[^ ]+' <<< "$params")
 tokenizer=$(grep -oP '(?<=--model.tokenizer_path )[^ ]+' <<< "$params")
-model=$(
-  python -c "import sys; sys.path.insert(0, '$(dirname $0)/..'); import fla, powerformer_hf, powerssm; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
-)
+# Extract model_type directly from the JSON config to skip a full Python
+# cold-start (~5s) on every launch. Falls back to the Python import path if
+# the JSON has a nested HF auto_map or similar that jq can't resolve.
+model=$(jq -r '.model_type // empty' "$config" 2>/dev/null)
+if [[ -z "$model" ]]; then
+  model=$(
+    python -c "import sys; sys.path.insert(0, '$(dirname $0)/..'); import fla, powerformer_hf, powerssm; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1]).to_json_string())" "$config" | jq -r '.model_type'
+  )
+fi
 
 mkdir -p $path
-cp * $path
-cp -r configs $path
-cp -r flame   $path
-cp -r 3rdparty/flash-linear-attention/fla $path
-cp -r 3rdparty/torchtitan/torchtitan $path
+# Archive a code snapshot into the exp dir for reproducibility. Skip the copy
+# entirely on re-launch / resume to save several seconds of I/O per startup.
+if [[ ! -d "$path/flame" ]]; then
+  echo "Archiving code snapshot under $path (first launch)..."
+  for f in *; do
+    [[ -f "$f" ]] && cp "$f" "$path/"
+  done
+  cp -r configs "$path"
+  cp -r flame   "$path"
+  cp -r 3rdparty/flash-linear-attention/fla "$path"
+  cp -r 3rdparty/torchtitan/torchtitan "$path"
+else
+  echo "Code snapshot already present under $path — skipping copy (set -f $path to force refresh)."
+fi
 
 # for offline systems
 # export TRANSFORMERS_OFFLINE=1
@@ -98,7 +113,7 @@ if [[ -z "${WANDB_RUN_ID}" ]]; then
 fi
 
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-torchrun --nnodes=${NNODE} \
+python -m torch.distributed.run --nnodes=${NNODE} \
   --nproc_per_node=${NGPU} \
   --rdzv_backend c10d \
   --rdzv_endpoint "${MASTER_ADDR}:${MASTER_PORT}" \
