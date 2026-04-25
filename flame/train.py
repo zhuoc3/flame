@@ -672,6 +672,20 @@ def main(job_config: JobConfig):
                 val_tokens += labels.numel()
         for m in model_parts:
             m.train()
+            # FSDP2 + HSDP: post_forward swaps each module._parameters[name]
+            # to a NEW post-forward nn.Parameter on a different mesh.
+            # Training restores the original identity in post_backward;
+            # validation runs no_grad, so post_backward never fires and
+            # the swap sticks. The next optimizer.state_dict() then
+            # raises KeyError in DCP _get_optim_state_dict because
+            # model.named_parameters() and optim.param_groups no longer
+            # match by id(). Calling reshard() from a non-FORWARD state
+            # falls through to _to_sharded(), which reattaches the
+            # original sharded_param. reshard() is non-recursive — walk
+            # all submodules.
+            for sub in m.modules():
+                if hasattr(sub, "reshard") and callable(getattr(sub, "reshard")):
+                    sub.reshard()
 
         avg_val_loss = torch.stack(val_losses).mean()
         if (
