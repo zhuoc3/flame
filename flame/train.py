@@ -724,7 +724,20 @@ def main(job_config: JobConfig):
             job_config, global_step=train_state.step
         ) as memory_profiler,
     ):
-        while train_state.step < job_config.training.steps:
+        # Stop a run at a smaller scientific token budget without changing the
+        # LR schedule horizon.  This is useful for direct trajectory
+        # comparisons against a longer baseline schedule.
+        max_steps_override = int(
+            os.environ.get("FLAME_MAX_STEPS_OVERRIDE", job_config.training.steps)
+        )
+        effective_max_steps = min(max_steps_override, job_config.training.steps)
+        if effective_max_steps < job_config.training.steps:
+            logger.info(
+                f"{color.yellow}FLAME_MAX_STEPS_OVERRIDE active: stopping at "
+                f"step {effective_max_steps:,}; LR schedule remains "
+                f"{job_config.training.steps:,} steps{color.reset}"
+            )
+        while train_state.step < effective_max_steps:
             train_state.step += 1
             gc_handler.run(train_state.step)
 
@@ -897,7 +910,7 @@ def main(job_config: JobConfig):
                 last_lr = lr_schedulers.schedulers[0].get_last_lr()[0]
                 eta = (
                     train_state.elapsed
-                    * (job_config.training.steps - train_state.step)
+                    * (effective_max_steps - train_state.step)
                     / train_state.step
                 )
                 metric_logger.log(
@@ -931,7 +944,7 @@ def main(job_config: JobConfig):
 
             checkpoint.save(
                 train_state.step,
-                force=(train_state.step == job_config.training.steps) or time_limit_triggered,
+                force=(train_state.step == effective_max_steps) or time_limit_triggered,
             )
 
             # Model-only archive snapshot. Survives `keep_latest_k` purge so the
@@ -947,7 +960,7 @@ def main(job_config: JobConfig):
                 _archive_every > 0
                 and train_state.step > 0
                 and (train_state.step % _archive_every == 0
-                     or train_state.step == job_config.training.steps)
+                     or train_state.step == effective_max_steps)
                 and train_state.step % _save_interval == 0
             ):
                 try:
@@ -1008,7 +1021,7 @@ def main(job_config: JobConfig):
     # checkpoint and exit.
     if (
         not time_limit_triggered
-        and train_state.step >= job_config.training.steps
+        and train_state.step >= effective_max_steps
         and torch.distributed.get_rank() == 0
     ):
         try:
