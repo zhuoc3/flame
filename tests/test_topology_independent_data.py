@@ -1,4 +1,5 @@
 import itertools
+import hashlib
 import json
 import tempfile
 import unittest
@@ -341,6 +342,34 @@ class TopologyIndependentDataTest(unittest.TestCase):
             self.assertEqual(child, 0)
             self.assertEqual(epoch, 0)
             torch.testing.assert_close(sample, expected, rtol=0, atol=0)
+
+    def test_memmap_store_optional_payload_verification_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tokens_path = root / "tokens.npy"
+            np.save(
+                tokens_path,
+                np.arange(32, dtype=np.uint16).reshape(4, 8),
+                allow_pickle=False,
+            )
+            digest = hashlib.sha256()
+            with tokens_path.open("rb") as handle:
+                version = np.lib.format.read_magic(handle)
+                self.assertEqual(version, (1, 0))
+                np.lib.format.read_array_header_1_0(handle)
+                digest.update(handle.read())
+            manifest = {
+                "seq_len": 8,
+                "num_rows": 4,
+                "tokens_payload_sha256": digest.hexdigest(),
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            MemmapTokenBlockDataset(root, verify_payload=True)
+
+            manifest["tokens_payload_sha256"] = "0" * 64
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "payload SHA256 mismatch"):
+                MemmapTokenBlockDataset(root, verify_payload=True)
 
     def test_sampler_rejects_non_exact_logical_batch(self):
         with self.assertRaisesRegex(ValueError, "one logical parent cohort"):

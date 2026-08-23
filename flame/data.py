@@ -636,7 +636,9 @@ def deterministic_permute(index: int, size: int, seed: int, epoch: int = 0) -> i
 class MemmapTokenBlockDataset(TorchDataset):
     """Dense, exact-length token blocks backed by a read-only NumPy mmap."""
 
-    def __init__(self, root: Union[str, Path]):
+    def __init__(
+        self, root: Union[str, Path], *, verify_payload: bool = False
+    ):
         self.root = Path(root)
         manifest_path = self.root / "manifest.json"
         if not manifest_path.is_file():
@@ -657,6 +659,31 @@ class MemmapTokenBlockDataset(TorchDataset):
         if tokens.dtype != np.uint16:
             raise ValueError(f"Token store must use uint16, got {tokens.dtype}")
         del tokens
+        if verify_payload:
+            expected_sha256 = self.manifest.get("tokens_payload_sha256")
+            if not expected_sha256:
+                raise ValueError(
+                    f"Token store {self.root} has no payload checksum to verify"
+                )
+            digest = hashlib.sha256()
+            with self.tokens_path.open("rb") as handle:
+                version = np.lib.format.read_magic(handle)
+                if version == (1, 0):
+                    np.lib.format.read_array_header_1_0(handle)
+                elif version == (2, 0):
+                    np.lib.format.read_array_header_2_0(handle)
+                else:
+                    raise ValueError(
+                        f"Unsupported NPY version {version} in {self.tokens_path}"
+                    )
+                while block := handle.read(8 << 20):
+                    digest.update(block)
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"Token payload SHA256 mismatch for {self.root}: "
+                    f"manifest={expected_sha256}, actual={actual_sha256}"
+                )
 
     @property
     def column_names(self) -> List[str]:

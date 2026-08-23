@@ -418,7 +418,12 @@ def main(job_config: JobConfig):
         logger.info(
             f"Loading fixed parent-block validation dataset from {fixed_val_dir}"
         )
-        fixed_val_dataset = MemmapTokenBlockDataset(fixed_val_dir)
+        # The fixed set is small (30 MiB), so every rank verifies its bytes at
+        # startup. Training's 40+ GiB parent store remains on launcher-level
+        # one-time verification and does not pay this per-rank cost.
+        fixed_val_dataset = MemmapTokenBlockDataset(
+            fixed_val_dir, verify_payload=True
+        )
         if fixed_val_dataset.seq_len != job_config.training.seq_len:
             raise ValueError(
                 "Fixed validation rows must already have the training sequence "
