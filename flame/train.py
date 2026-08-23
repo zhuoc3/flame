@@ -26,8 +26,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.common.utils import prepare_position_ids
 from flame.components.checkpoint import (
+    FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
     PARALLEL_TOPOLOGY_STATE_KEY,
+    FixedTestPlanState,
     FixedValidationPlanState,
     ParallelTopology,
     ParallelTopologyState,
@@ -500,6 +502,66 @@ def main(job_config: JobConfig):
             f"{job_config.training.val_batches} batches"
         )
 
+    # Final test evaluation is a separate opt-in immutable token set. It has
+    # no cursor: every terminal run starts at row zero and consumes all rows.
+    test_dataloader = None
+    fixed_test_tokens = None
+    fixed_test_plan_state = None
+    test_batches_per_rank = 0
+    fixed_test_dir = getattr(
+        job_config.training, "fixed_test_parent_blocks_dir", None
+    )
+    if fixed_test_dir:
+        logger.info(
+            f"Loading fixed parent-block test dataset from {fixed_test_dir}"
+        )
+        fixed_test_dataset = MemmapTokenBlockDataset(
+            fixed_test_dir, verify_payload=True
+        )
+        if fixed_test_dataset.seq_len != job_config.training.seq_len:
+            raise ValueError(
+                "Fixed test rows must already have the training sequence length: "
+                f"store={fixed_test_dataset.seq_len}, "
+                f"training={job_config.training.seq_len}"
+            )
+        fixed_test_sampler = FixedValidationSampler(
+            rank=dp_rank,
+            world_size=dp_degree,
+            batch_size=job_config.training.batch_size,
+            num_samples=len(fixed_test_dataset),
+        )
+        test_dataloader = torch.utils.data.DataLoader(
+            Int64TokenBlockDatasetView(fixed_test_dataset),
+            sampler=fixed_test_sampler,
+            batch_size=job_config.training.batch_size,
+            collate_fn=DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                context_len=job_config.training.context_len,
+                varlen=job_config.training.varlen,
+            ),
+            num_workers=0,
+        )
+        test_batches_per_rank = len(test_dataloader)
+        fixed_test_tokens = len(fixed_test_dataset) * fixed_test_dataset.seq_len
+        fixed_test_plan_state = FixedTestPlanState(
+            {
+                "schema_version": 1,
+                "manifest_sha256": fixed_test_dataset.manifest_sha256,
+                "tokens_payload_sha256": fixed_test_dataset.manifest.get(
+                    "tokens_payload_sha256"
+                ),
+                "num_sequences": len(fixed_test_dataset),
+                "seq_len": fixed_test_dataset.seq_len,
+            }
+        )
+        logger.info(
+            "Fixed test enabled: run once after training, "
+            f"global_sequences={len(fixed_test_dataset):,}, "
+            f"global_tokens={fixed_test_tokens:,}, "
+            f"local_batches={test_batches_per_rank:,}, "
+            f"manifest_sha256={fixed_test_dataset.manifest_sha256}"
+        )
+
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
     # set the model configs from training inputs:
@@ -660,6 +722,8 @@ def main(job_config: JobConfig):
     }
     if fixed_validation_plan_state is not None:
         checkpoint_states[FIXED_VALIDATION_STATE_KEY] = fixed_validation_plan_state
+    if fixed_test_plan_state is not None:
+        checkpoint_states[FIXED_TEST_STATE_KEY] = fixed_test_plan_state
 
     checkpoint = CheckpointManager(
         dataloader=dataloader,
@@ -931,6 +995,63 @@ def main(job_config: JobConfig):
         )
         metric_logger.logger.log(
             {"val/loss": avg_val_loss, "val/perplexity": val_ppl},
+            step,
+        )
+
+    def run_fixed_test(step):
+        if test_dataloader is None:
+            return
+        test_losses = []
+        for m in model_parts:
+            m.eval()
+        test_iterator = iter(test_dataloader)
+        with torch.no_grad():
+            for _ in range(test_batches_per_rank):
+                try:
+                    batch = next(test_iterator)
+                except StopIteration as error:
+                    raise RuntimeError(
+                        "Fixed test iterator ended before every selected sequence "
+                        "was evaluated"
+                    ) from error
+                input_ids = batch["input_ids"].to(device_type)
+                labels = batch["labels"].to(device_type)
+                position_ids = (
+                    torch.arange(0, input_ids.shape[1], device=device_type)
+                    .repeat(input_ids.shape[0], 1)
+                    .to(torch.int32)
+                )
+                output = model_parts[0](
+                    input_ids=input_ids,
+                    labels=labels,
+                    position_ids=position_ids,
+                )
+                test_losses.append(output.loss.detach())
+        for m in model_parts:
+            m.train()
+            for sub in m.modules():
+                if hasattr(sub, "reshard") and callable(getattr(sub, "reshard")):
+                    sub.reshard()
+
+        avg_test_loss = torch.stack(test_losses).mean()
+        if (
+            parallel_dims.dp_replicate_enabled
+            or parallel_dims.dp_shard_enabled
+            or parallel_dims.cp_enabled
+        ):
+            avg_test_loss = dist_utils.dist_mean(
+                avg_test_loss, world_mesh["dp_cp"]
+            )
+
+        if isinstance(avg_test_loss, torch.Tensor):
+            avg_test_loss = avg_test_loss.item()
+        test_ppl = 2.718281828 ** avg_test_loss
+        logger.info(
+            f"{color.cyan}[test] step {step}: loss={avg_test_loss:.4f} "
+            f"ppl={test_ppl:.2f} ({fixed_test_tokens} tokens){color.reset}"
+        )
+        metric_logger.logger.log(
+            {"test/loss": avg_test_loss, "test/perplexity": test_ppl},
             step,
         )
 
@@ -1242,6 +1363,12 @@ def main(job_config: JobConfig):
                     world_mesh=world_mesh,
                 )
 
+    training_completed = (
+        not time_limit_triggered and train_state.step >= _effective_max_steps
+    )
+    if training_completed and test_dataloader is not None:
+        run_fixed_test(train_state.step)
+
     # Training-done marker + chain-mate scancel. Mirrors the synthetic trainer's
     # behavior: when the loop runs to completion (not broken out of for a
     # time-limit save), rank 0 persists a TRAINING_DONE marker in the dump
@@ -1249,8 +1376,7 @@ def main(job_config: JobConfig):
     # so the rest of the dependency chain doesn't just reload the final
     # checkpoint and exit.
     if (
-        not time_limit_triggered
-        and train_state.step >= _effective_max_steps
+        training_completed
         and torch.distributed.get_rank() == 0
     ):
         try:

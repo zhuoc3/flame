@@ -8,13 +8,16 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from flame.components.checkpoint import (
+    FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
     PARALLEL_TOPOLOGY_STATE_KEY,
+    FixedTestPlanState,
     FixedValidationPlanState,
     ParallelTopology,
     ParallelTopologyState,
     inspect_checkpoint_topology,
 )
+from flame.config_manager import JobConfig
 
 
 def _hsdp_4x2() -> ParallelTopology:
@@ -26,6 +29,14 @@ def _hsdp_4x4() -> ParallelTopology:
 
 
 class CheckpointTopologyTest(unittest.TestCase):
+    def test_fixed_test_is_opt_in_and_legacy_validation_defaults_are_unchanged(
+        self,
+    ) -> None:
+        args = JobConfig().parser.parse_args([])
+        self.assertIsNone(getattr(args, "training.fixed_test_parent_blocks_dir"))
+        self.assertIsNone(getattr(args, "training.fixed_val_parent_blocks_dir"))
+        self.assertIsNone(getattr(args, "training.val_data_dir"))
+
     def test_fixed_validation_plan_roundtrip_and_mismatch(self) -> None:
         plan = {
             "schema_version": 1,
@@ -57,6 +68,39 @@ class CheckpointTopologyTest(unittest.TestCase):
                                 changed
                             )
                         },
+                        checkpoint_id=checkpoint_id,
+                    )
+
+        self.assertEqual(matching.loaded, plan)
+
+    def test_fixed_test_plan_roundtrip_and_mismatch(self) -> None:
+        plan = {
+            "schema_version": 1,
+            "manifest_sha256": "test-manifest-a",
+            "tokens_payload_sha256": "test-payload-a",
+            "num_sequences": 960,
+            "seq_len": 16_384,
+        }
+        self.assertNotEqual(FIXED_TEST_STATE_KEY, FIXED_VALIDATION_STATE_KEY)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_id = Path(temp_dir) / "step-10000"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                dcp.save(
+                    {FIXED_TEST_STATE_KEY: FixedTestPlanState(plan)},
+                    checkpoint_id=checkpoint_id,
+                )
+                matching = FixedTestPlanState(plan)
+                dcp.load(
+                    {FIXED_TEST_STATE_KEY: matching},
+                    checkpoint_id=checkpoint_id,
+                )
+                changed = dict(plan, tokens_payload_sha256="test-payload-b")
+                with self.assertRaisesRegex(
+                    ValueError, "Fixed test plan changed across resume"
+                ):
+                    dcp.load(
+                        {FIXED_TEST_STATE_KEY: FixedTestPlanState(changed)},
                         checkpoint_id=checkpoint_id,
                     )
 

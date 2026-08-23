@@ -359,6 +359,15 @@ class JobConfig:
             ),
         )
         self.parser.add_argument(
+            "--training.fixed_test_parent_blocks_dir",
+            default=None,
+            help=(
+                "Opt-in immutable uint16 parent-block test store. The complete "
+                "set is evaluated exactly once after training finishes and is "
+                "partitioned without duplication across the active DP layout."
+            ),
+        )
+        self.parser.add_argument(
             "--training.val_interval",
             type=int,
             default=500,

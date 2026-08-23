@@ -19,6 +19,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 PARALLEL_TOPOLOGY_STATE_KEY = "parallel_topology"
 PARALLEL_TOPOLOGY_SCHEMA_VERSION = 1
 FIXED_VALIDATION_STATE_KEY = "fixed_validation_plan"
+FIXED_TEST_STATE_KEY = "fixed_test_plan"
 
 
 def _scalar_int(value: Any) -> int:
@@ -159,6 +160,29 @@ class FixedValidationPlanState(Stateful):
         if loaded != self.current:
             raise ValueError(
                 "Fixed validation plan changed across resume: "
+                f"saved={loaded}, current={self.current}"
+            )
+
+
+class FixedTestPlanState(Stateful):
+    """Cursor-free checkpoint binding for an immutable test token set."""
+
+    def __init__(self, current: Mapping[str, Any]) -> None:
+        self.current = dict(current)
+        self.loaded: Optional[Dict[str, Any]] = None
+
+    def state_dict(self) -> Dict[str, BytesIO]:
+        payload = json.dumps(self.current, sort_keys=True).encode("utf-8")
+        return {"plan": BytesIO(payload)}
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        payload = state_dict["plan"]
+        payload.seek(0)
+        loaded = json.loads(payload.read().decode("utf-8"))
+        self.loaded = loaded
+        if loaded != self.current:
+            raise ValueError(
+                "Fixed test plan changed across resume: "
                 f"saved={loaded}, current={self.current}"
             )
 
