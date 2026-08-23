@@ -38,6 +38,7 @@ from flame.config_manager import JobConfig
 from flame.data import (
     DataCollatorForLanguageModeling,
     FixedValidationSampler,
+    Int64TokenBlockDatasetView,
     MemmapTokenBlockDataset,
     TopologyIndependentDataLoader,
     build_dataloader,
@@ -437,7 +438,7 @@ def main(job_config: JobConfig):
             num_samples=len(fixed_val_dataset),
         )
         val_dataloader = torch.utils.data.DataLoader(
-            fixed_val_dataset,
+            Int64TokenBlockDatasetView(fixed_val_dataset),
             sampler=fixed_val_sampler,
             batch_size=job_config.training.batch_size,
             collate_fn=DataCollatorForLanguageModeling(

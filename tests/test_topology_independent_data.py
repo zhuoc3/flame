@@ -10,8 +10,10 @@ import torch
 from torch.utils.data import Dataset
 
 from flame.data import (
+    DataCollatorForLanguageModeling,
     DeterministicParentBlockDataset,
     FixedValidationSampler,
+    Int64TokenBlockDatasetView,
     MemmapTokenBlockDataset,
     TopologyIndependentDataLoader,
     TopologyIndependentSampler,
@@ -29,6 +31,10 @@ class _IndexDataset(Dataset):
 
     def __getitem__(self, index: int) -> int:
         return index
+
+
+class _IdentityTokenizer:
+    pad_token_id = 0
 
 
 def _index_collate(indices):
@@ -370,6 +376,46 @@ class TopologyIndependentDataTest(unittest.TestCase):
             (root / "manifest.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "payload SHA256 mismatch"):
                 MemmapTokenBlockDataset(root, verify_payload=True)
+
+    def test_fixed_validation_loader_casts_uint16_rows_to_int64(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = np.arange(32, dtype=np.uint16).reshape(4, 8)
+            np.save(root / "tokens.npy", source, allow_pickle=False)
+            (root / "manifest.json").write_text(
+                json.dumps({"seq_len": 8, "num_rows": 4})
+            )
+
+            dataset = Int64TokenBlockDatasetView(
+                MemmapTokenBlockDataset(root)
+            )
+            sampler = FixedValidationSampler(
+                rank=1, world_size=2, batch_size=1, num_samples=len(dataset)
+            )
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                sampler=sampler,
+                batch_size=1,
+                collate_fn=DataCollatorForLanguageModeling(
+                    tokenizer=_IdentityTokenizer(), context_len=8, varlen=False
+                ),
+                num_workers=0,
+            )
+
+            batches = list(loader)
+            self.assertEqual(len(batches), 2)
+            for batch, row in zip(batches, (1, 3)):
+                self.assertEqual(batch["input_ids"].dtype, torch.int64)
+                self.assertEqual(batch["labels"].dtype, torch.int64)
+                torch.testing.assert_close(
+                    batch["input_ids"][0],
+                    torch.from_numpy(source[row].astype(np.int64)),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    batch["labels"], batch["input_ids"], rtol=0, atol=0
+                )
 
     def test_sampler_rejects_non_exact_logical_batch(self):
         with self.assertRaisesRegex(ValueError, "one logical parent cohort"):

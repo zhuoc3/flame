@@ -706,6 +706,22 @@ class MemmapTokenBlockDataset(TorchDataset):
         return state
 
 
+class Int64TokenBlockDatasetView(TorchDataset):
+    """Tensor view of token blocks suitable for model inputs and labels."""
+
+    def __init__(self, dataset: TorchDataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        tokens = np.array(
+            self.dataset[index]["input_ids"], dtype=np.int64, copy=True
+        )
+        return {"input_ids": torch.from_numpy(tokens)}
+
+
 class DeterministicParentBlockDataset(TorchDataset):
     """Virtual short-sequence view over shuffled fixed-length parent blocks.
 
