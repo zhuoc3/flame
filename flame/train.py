@@ -25,9 +25,24 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.common.utils import prepare_position_ids
-from flame.components.checkpoint import TrainState
+from flame.components.checkpoint import (
+    FIXED_VALIDATION_STATE_KEY,
+    PARALLEL_TOPOLOGY_STATE_KEY,
+    FixedValidationPlanState,
+    ParallelTopology,
+    ParallelTopologyState,
+    TrainState,
+    inspect_checkpoint_topology,
+)
 from flame.config_manager import JobConfig
-from flame.data import build_dataloader, shuffle
+from flame.data import (
+    DataCollatorForLanguageModeling,
+    FixedValidationSampler,
+    MemmapTokenBlockDataset,
+    TopologyIndependentDataLoader,
+    build_dataloader,
+    shuffle,
+)
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
@@ -163,7 +178,15 @@ def main(job_config: JobConfig):
 
     min_num_shards = dp_degree * job_config.training.num_workers
     if len(job_config.training.dataset.split(",")) == 1:
-        if job_config.training.dataset == "disk":
+        deterministic_parent_blocks = job_config.training.dataset == "parent_blocks"
+        if deterministic_parent_blocks:
+            dataset = MemmapTokenBlockDataset(job_config.training.data_dir)
+            logger.info(
+                "Loaded deterministic parent-block store: "
+                f"rows={len(dataset):,}, seq_len={dataset.seq_len:,}, "
+                f"path={job_config.training.data_dir}"
+            )
+        elif job_config.training.dataset == "disk":
             # Load dataset saved with save_to_disk()
             dataset = load_from_disk(job_config.training.data_dir)
             logger.info(f"Loaded dataset from disk: {dataset}")
@@ -185,7 +208,12 @@ def main(job_config: JobConfig):
             logger.info(f"{dataset}")
 
         logger.info(f"Shuffling the dataset with seed {job_config.training.seed}")
-        if not job_config.training.streaming:
+        if deterministic_parent_blocks:
+            logger.info(
+                "Parent-block shuffle is generated deterministically by global "
+                "optimizer step; skipping topology-dependent HF sharding"
+            )
+        elif not job_config.training.streaming:
             # the states of map-style dataset is recoverable after shuffling
             dataset = dataset.shuffle(
                 seed=job_config.training.seed
@@ -326,13 +354,16 @@ def main(job_config: JobConfig):
                         buffer_size=max(128, 1024 // len(datasets)),
                     )
 
-            if "text" in subset.column_names:
+            if "input_ids" in subset.column_names:
+                # Pre-tokenized path (long-context-only single-doc dataset).
+                subset = subset.select_columns("input_ids")
+            elif "text" in subset.column_names:
                 subset = subset.select_columns("text")
             elif "content" in subset.column_names:
                 subset = subset.select_columns("content")
             else:
                 raise ValueError(
-                    f"Subset {datasets[i]} has no 'text' or 'content' column"
+                    f"Subset {datasets[i]} has no 'input_ids', 'text', or 'content' column"
                 )
             subsets.append(subset)
 
@@ -361,17 +392,86 @@ def main(job_config: JobConfig):
         pin_memory=job_config.training.pin_memory,
         persistent_workers=job_config.training.persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
+        gradient_accumulation_steps=job_config.training.gradient_accumulation_steps,
+        seed=job_config.training.seed,
+        parent_blocks_per_step=job_config.training.parent_blocks_per_step,
     )
 
-    # Validation dataloader (optional)
+    # Validation dataloader (optional). The fixed parent-block mode is
+    # deliberately opt-in so existing runs retain their historical iterator.
     val_dataloader = None
+    fixed_validation = False
+    fixed_validation_tokens = None
+    fixed_validation_plan_state = None
+    val_batches_per_rank = job_config.training.val_batches
     val_data_dir = getattr(job_config.training, "val_data_dir", None)
-    if val_data_dir:
+    fixed_val_dir = getattr(
+        job_config.training, "fixed_val_parent_blocks_dir", None
+    )
+    if val_data_dir and fixed_val_dir:
+        raise ValueError(
+            "Choose exactly one validation mode: --training.val_data_dir keeps "
+            "the legacy advancing online-tokenized stream, while "
+            "--training.fixed_val_parent_blocks_dir uses an immutable fixed set"
+        )
+    if fixed_val_dir:
+        logger.info(
+            f"Loading fixed parent-block validation dataset from {fixed_val_dir}"
+        )
+        fixed_val_dataset = MemmapTokenBlockDataset(fixed_val_dir)
+        if fixed_val_dataset.seq_len != job_config.training.seq_len:
+            raise ValueError(
+                "Fixed validation rows must already have the training sequence "
+                f"length: store={fixed_val_dataset.seq_len}, "
+                f"training={job_config.training.seq_len}"
+            )
+        fixed_val_sampler = FixedValidationSampler(
+            rank=dp_rank,
+            world_size=dp_degree,
+            batch_size=job_config.training.batch_size,
+            num_samples=len(fixed_val_dataset),
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            fixed_val_dataset,
+            sampler=fixed_val_sampler,
+            batch_size=job_config.training.batch_size,
+            collate_fn=DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                context_len=job_config.training.context_len,
+                varlen=job_config.training.varlen,
+            ),
+            num_workers=0,
+        )
+        fixed_validation = True
+        val_batches_per_rank = len(val_dataloader)
+        fixed_validation_tokens = (
+            len(fixed_val_dataset) * fixed_val_dataset.seq_len
+        )
+        fixed_validation_plan_state = FixedValidationPlanState(
+            {
+                "schema_version": 1,
+                "manifest_sha256": fixed_val_dataset.manifest_sha256,
+                "tokens_payload_sha256": fixed_val_dataset.manifest.get(
+                    "tokens_payload_sha256"
+                ),
+                "num_sequences": len(fixed_val_dataset),
+                "seq_len": fixed_val_dataset.seq_len,
+            }
+        )
+        logger.info(
+            "Fixed validation enabled: "
+            f"every {job_config.training.val_interval} steps, "
+            f"global_sequences={len(fixed_val_dataset):,}, "
+            f"global_tokens={fixed_validation_tokens:,}, "
+            f"local_batches={val_batches_per_rank:,}, "
+            f"manifest_sha256={fixed_val_dataset.manifest_sha256}"
+        )
+    elif val_data_dir:
         logger.info(f"Loading validation dataset from {val_data_dir}")
         val_dataset = load_from_disk(val_data_dir)
         logger.info(f"Validation dataset: {val_dataset}")
         val_dataset = val_dataset.to_iterable_dataset(num_shards=max(1, dp_degree))
-        from flame.data import OnlineTokenizedIterableDataset, DataCollatorForLanguageModeling
+        from flame.data import OnlineTokenizedIterableDataset
         val_tok_dataset = OnlineTokenizedIterableDataset(
             dataset=val_dataset,
             tokenizer=tokenizer,
@@ -544,14 +644,23 @@ def main(job_config: JobConfig):
     )
 
     train_state = TrainState()
+    current_topology = ParallelTopology.from_parallel_dims(parallel_dims)
+    parallel_topology_state = ParallelTopologyState(current_topology)
 
     # load initial checkpoint
+    checkpoint_states = {
+        "train_state": train_state,
+        PARALLEL_TOPOLOGY_STATE_KEY: parallel_topology_state,
+    }
+    if fixed_validation_plan_state is not None:
+        checkpoint_states[FIXED_VALIDATION_STATE_KEY] = fixed_validation_plan_state
+
     checkpoint = CheckpointManager(
         dataloader=dataloader,
         model_parts=model_parts,
         optimizers=optimizers,
         lr_schedulers=lr_schedulers,
-        states={"train_state": train_state},
+        states=checkpoint_states,
         job_config=job_config,
         ft_manager=ft_manager,
     )
@@ -567,7 +676,103 @@ def main(job_config: JobConfig):
         logger.info("Created seed checkpoint")
         return
 
-    checkpoint.load(step=job_config.checkpoint.load_step)
+    requested_load_step = job_config.checkpoint.load_step
+    resolved_load_step = requested_load_step
+    if checkpoint.enable_checkpoint and resolved_load_step == -1:
+        resolved_load_step = checkpoint._find_load_step()
+
+    topology_decision = None
+    if checkpoint.enable_checkpoint and resolved_load_step >= 0:
+        checkpoint_id = checkpoint._create_checkpoint_id(resolved_load_step)
+        if resolved_load_step == 0:
+            # TorchTitan deliberately loads only MODEL from a seed checkpoint.
+            # Do not apply topology/dataloader migration rules to states that
+            # are neither requested nor present in its model-only load map.
+            logger.info(
+                "Checkpoint step 0 is a model-only seed; topology and dataloader "
+                "state will start from the current distributed configuration"
+            )
+        elif os.path.isdir(checkpoint_id):
+            topology_decision = inspect_checkpoint_topology(
+                checkpoint_id, current_topology
+            )
+            if not topology_decision.metadata_found:
+                # Legacy checkpoints predate global topology and deterministic
+                # data-plan state. Omit only the missing topology key; for the
+                # new loader, also ignore its old rank-local loader payload.
+                checkpoint.states.pop(PARALLEL_TOPOLOGY_STATE_KEY, None)
+                if isinstance(dataloader, TopologyIndependentDataLoader):
+                    if not job_config.training.allow_legacy_data_restart:
+                        raise RuntimeError(
+                            "Checkpoint predates the deterministic parent-block "
+                            "plan. Model/optimizer state can resume exactly, but "
+                            "historical data continuity cannot be guaranteed. "
+                            "Pass --training.allow_legacy_data_restart only if "
+                            "starting the new plan at train_state.step is intended."
+                        )
+                    if "dataloader" not in checkpoint.exclude_from_loading:
+                        checkpoint.exclude_from_loading.append("dataloader")
+                    logger.warning(
+                        f"Checkpoint step {resolved_load_step:,} predates topology "
+                        "metadata and the deterministic data plan. DCP will load "
+                        "model/optimizer state and start the parent-block schedule "
+                        "at train_state.step, but data consumed before this legacy "
+                        "checkpoint cannot be proven continuous with the new plan."
+                    )
+                else:
+                    saved_dp_degree = topology_decision.legacy_data_parallel_degree
+                    if saved_dp_degree is None:
+                        raise RuntimeError(
+                            "Legacy checkpoint has no topology metadata and its "
+                            "saved dataloader DP degree cannot be determined. Exact "
+                            "resume is unsafe; use --training.dataset parent_blocks "
+                            "to reconstruct from train_state.step."
+                        )
+                    if saved_dp_degree != current_topology.dp_degree:
+                        raise RuntimeError(
+                            "Legacy rank-local dataloader cannot be reshaped from "
+                            f"DP degree {saved_dp_degree} to "
+                            f"{current_topology.dp_degree}. Use "
+                            "--training.dataset parent_blocks for a deterministic "
+                            "step-based loader."
+                        )
+                    logger.warning(
+                        f"Checkpoint step {resolved_load_step:,} predates topology "
+                        "metadata; its rank-local dataloader has the same DP degree "
+                        f"({saved_dp_degree}) and will be restored. Do not change "
+                        "DP degree without switching to dataset=parent_blocks."
+                    )
+            elif topology_decision.topology_changed:
+                if not isinstance(dataloader, TopologyIndependentDataLoader):
+                    raise RuntimeError(
+                        "Checkpoint topology changed but the configured dataloader "
+                        "is rank-local. Use --training.dataset parent_blocks for "
+                        "exact topology-independent resume."
+                    )
+                logger.warning(
+                    "Checkpoint topology changed in "
+                    f"{topology_decision.changed_dimensions}: "
+                    f"saved={topology_decision.saved}, current={current_topology}. "
+                    "DCP will reshard model and optimizer state automatically; "
+                    "the dataloader will be reconstructed after load."
+                )
+            else:
+                logger.info(
+                    f"Checkpoint topology matches current topology: {current_topology}"
+                )
+
+    checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    # A legacy load temporarily omitted this missing key. All subsequent
+    # checkpoints record the current topology.
+    if checkpoint.enable_checkpoint:
+        checkpoint.states[PARALLEL_TOPOLOGY_STATE_KEY] = parallel_topology_state
+    if hasattr(dataloader, "set_optimizer_step"):
+        dataloader.set_optimizer_step(train_state.step)
+        logger.info(
+            "Reconstructed topology-independent dataloader at completed optimizer "
+            f"step {train_state.step:,}"
+            + (" after checkpoint load" if checkpoint_loaded else "")
+        )
     metric_logger = build_metrics_processor(job_config, parallel_dims)
     # Set dependent attributes for metric_logger
     metric_logger.num_flops_per_token = num_flops_per_token
@@ -639,7 +844,11 @@ def main(job_config: JobConfig):
     )
 
     # Validation evaluation function (works with FSDP/HSDP — model stays wrapped)
-    val_iterator = iter(val_dataloader) if val_dataloader is not None else None
+    val_iterator = (
+        iter(val_dataloader)
+        if val_dataloader is not None and not fixed_validation
+        else None
+    )
 
     def run_validation(step):
         nonlocal val_iterator
@@ -649,13 +858,22 @@ def main(job_config: JobConfig):
         val_tokens = 0
         for m in model_parts:
             m.eval()
+        current_val_iterator = (
+            iter(val_dataloader) if fixed_validation else val_iterator
+        )
         with torch.no_grad():
-            for _ in range(job_config.training.val_batches):
+            for _ in range(val_batches_per_rank):
                 try:
-                    batch = next(val_iterator)
+                    batch = next(current_val_iterator)
                 except StopIteration:
+                    if fixed_validation:
+                        raise RuntimeError(
+                            "Fixed validation iterator ended before every selected "
+                            "sequence was evaluated"
+                        )
                     val_iterator = iter(val_dataloader)
-                    batch = next(val_iterator)
+                    current_val_iterator = val_iterator
+                    batch = next(current_val_iterator)
                 input_ids = batch["input_ids"].to(device_type)
                 labels = batch["labels"].to(device_type)
                 position_ids = (
@@ -698,9 +916,12 @@ def main(job_config: JobConfig):
         if isinstance(avg_val_loss, torch.Tensor):
             avg_val_loss = avg_val_loss.item()
         val_ppl = 2.718281828 ** avg_val_loss
+        displayed_val_tokens = (
+            fixed_validation_tokens if fixed_validation else val_tokens
+        )
         logger.info(
             f"{color.cyan}[val] step {step}: loss={avg_val_loss:.4f} ppl={val_ppl:.2f} "
-            f"({val_tokens} tokens){color.reset}"
+            f"({displayed_val_tokens} tokens){color.reset}"
         )
         metric_logger.logger.log(
             {"val/loss": avg_val_loss, "val/perplexity": val_ppl},
@@ -724,7 +945,22 @@ def main(job_config: JobConfig):
             job_config, global_step=train_state.step
         ) as memory_profiler,
     ):
-        while train_state.step < job_config.training.steps:
+        # FLAME_MAX_STEPS_OVERRIDE: cap the training loop at a step count
+        # smaller than job_config.training.steps, while leaving the LR scheduler
+        # horizon at training.steps. Lets you run "X-step partial cosine"
+        # without rewriting the schedule. Used by short ablation chains that
+        # want the full-run LR profile over a fraction of the steps.
+        _flame_max_steps_override = int(
+            os.environ.get("FLAME_MAX_STEPS_OVERRIDE", job_config.training.steps)
+        )
+        _effective_max_steps = min(_flame_max_steps_override, job_config.training.steps)
+        if _effective_max_steps < job_config.training.steps:
+            logger.info(
+                f"{color.yellow}FLAME_MAX_STEPS_OVERRIDE active: loop will halt at "
+                f"step {_effective_max_steps:,} (LR scheduler uses "
+                f"{job_config.training.steps:,}){color.reset}"
+            )
+        while train_state.step < _effective_max_steps:
             train_state.step += 1
             gc_handler.run(train_state.step)
 
@@ -931,7 +1167,7 @@ def main(job_config: JobConfig):
 
             checkpoint.save(
                 train_state.step,
-                force=(train_state.step == job_config.training.steps) or time_limit_triggered,
+                force=(train_state.step == _effective_max_steps) or time_limit_triggered,
             )
 
             # Model-only archive snapshot. Survives `keep_latest_k` purge so the
@@ -947,7 +1183,7 @@ def main(job_config: JobConfig):
                 _archive_every > 0
                 and train_state.step > 0
                 and (train_state.step % _archive_every == 0
-                     or train_state.step == job_config.training.steps)
+                     or train_state.step == _effective_max_steps)
                 and train_state.step % _save_interval == 0
             ):
                 try:
@@ -1008,7 +1244,7 @@ def main(job_config: JobConfig):
     # checkpoint and exit.
     if (
         not time_limit_triggered
-        and train_state.step >= job_config.training.steps
+        and train_state.step >= _effective_max_steps
         and torch.distributed.get_rank() == 0
     ):
         try:

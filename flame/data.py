@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import pickle
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
 import datasets
 import numpy as np
@@ -14,6 +18,8 @@ import torch
 from datasets import Dataset, IterableDataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer
 
@@ -541,6 +547,349 @@ class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
         super().load_state_dict(pickle.loads(state_dict[f'rank_{self.rank}']))
 
 
+class PreTokenizedIterableDataset(IterableDataset):
+    """Yield pre-tokenized rows as `seq_len`-token sequences.
+
+    Each row of `dataset` is expected to have an `input_ids` field that is
+    already at least `seq_len` long. We take the first `seq_len` tokens
+    of each row — NO cross-document concatenation, so each yielded sequence
+    comes from a single source document. Used for "long-context-only"
+    training, where the dataset was pre-filtered to docs >= seq_len tokens.
+
+    State dict is intentionally minimal: we shard the dataset across ranks,
+    iterate forever, and rely on the dataloader's batch counter for resume
+    determinism. (This loader is NOT bit-exact resume; sequences are deterministic
+    in order, but the global step count rebuilds the position.)
+    """
+
+    def __init__(self, dataset: Dataset, seq_len: int, rank: int, world_size: int):
+        self.dataset = dataset
+        self.seq_len = seq_len
+        self.rank = rank
+        self.world_size = world_size
+        self.data = dataset.shard(world_size, rank)
+
+    def __iter__(self):
+        while True:
+            for sample in self.data:
+                ids = sample['input_ids']
+                if len(ids) >= self.seq_len:
+                    yield {'input_ids': torch.tensor(ids[:self.seq_len], dtype=torch.long)}
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+        if hasattr(self.dataset, 'set_epoch'):
+            self.dataset.set_epoch(epoch)
+
+    def state_dict(self):
+        return {}  # stateless — resume is approximate
+
+    def load_state_dict(self, state_dict):
+        pass
+
+
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _splitmix64(value: int) -> int:
+    """Version-independent 64-bit mixing used by the parent-block PRP."""
+    value = (value + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return value ^ (value >> 31)
+
+
+def deterministic_permute(index: int, size: int, seed: int, epoch: int = 0) -> int:
+    """Apply a deterministic pseudorandom permutation to ``range(size)``.
+
+    A six-round balanced Feistel network permutes a power-of-four domain and
+    cycle walking restricts it to ``[0, size)``. Unlike ``randperm``, this is
+    O(1) memory and does not depend on NumPy/PyTorch RNG implementation details.
+    """
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {size}")
+    if not 0 <= index < size:
+        raise IndexError(f"index {index} is outside [0, {size})")
+    if size == 1:
+        return 0
+
+    bits = max(2, (size - 1).bit_length())
+    if bits % 2:
+        bits += 1
+    half_bits = bits // 2
+    half_mask = (1 << half_bits) - 1
+    key = _splitmix64((seed & _UINT64_MASK) ^ _splitmix64(epoch & _UINT64_MASK))
+
+    def feistel(value: int) -> int:
+        left, right = value >> half_bits, value & half_mask
+        for round_idx in range(6):
+            round_key = _splitmix64(key ^ ((round_idx + 1) * 0xD6E8FEB86659FD93))
+            left, right = right, left ^ (_splitmix64(right ^ round_key) & half_mask)
+        return (left << half_bits) | right
+
+    result = feistel(index)
+    while result >= size:
+        result = feistel(result)
+    return result
+
+
+class MemmapTokenBlockDataset(TorchDataset):
+    """Dense, exact-length token blocks backed by a read-only NumPy mmap."""
+
+    def __init__(self, root: Union[str, Path]):
+        self.root = Path(root)
+        manifest_path = self.root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Parent-block manifest not found: {manifest_path}")
+        self.manifest = json.loads(manifest_path.read_text())
+        self.manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        self.seq_len = int(self.manifest["seq_len"])
+        self.num_rows = int(self.manifest["num_rows"])
+        self.tokens_path = self.root / self.manifest.get("tokens_file", "tokens.npy")
+        self._tokens = None
+
+        tokens = np.load(self.tokens_path, mmap_mode="r", allow_pickle=False)
+        expected_shape = (self.num_rows, self.seq_len)
+        if tokens.shape != expected_shape:
+            raise ValueError(
+                f"Token store shape is {tokens.shape}, manifest says {expected_shape}"
+            )
+        if tokens.dtype != np.uint16:
+            raise ValueError(f"Token store must use uint16, got {tokens.dtype}")
+        del tokens
+
+    @property
+    def column_names(self) -> List[str]:
+        return ["input_ids"]
+
+    def __len__(self) -> int:
+        return self.num_rows
+
+    def _array(self):
+        if self._tokens is None:
+            self._tokens = np.load(self.tokens_path, mmap_mode="r", allow_pickle=False)
+        return self._tokens
+
+    def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
+        return {"input_ids": self._array()[index]}
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_tokens"] = None
+        return state
+
+
+class DeterministicParentBlockDataset(TorchDataset):
+    """Virtual short-sequence view over shuffled fixed-length parent blocks.
+
+    The integer index is a global sample ordinal. Each optimizer step consumes
+    ``parent_blocks_per_step`` shuffled parents, and child chunks are ordered
+    child-major so physical ranks receive an interleaved mix of parents.
+    """
+
+    def __init__(
+        self,
+        parent_dataset: TorchDataset,
+        seq_len: int,
+        parent_seq_len: int,
+        parent_blocks_per_step: int,
+        seed: int,
+    ):
+        if parent_seq_len % seq_len:
+            raise ValueError(
+                f"seq_len={seq_len} must divide parent_seq_len={parent_seq_len}"
+            )
+        if parent_blocks_per_step <= 0:
+            raise ValueError("parent_blocks_per_step must be positive")
+        if len(parent_dataset) < parent_blocks_per_step:
+            raise ValueError(
+                f"Dataset has {len(parent_dataset)} parents but each step needs "
+                f"{parent_blocks_per_step}"
+            )
+        self.parent_dataset = parent_dataset
+        self.seq_len = seq_len
+        self.parent_seq_len = parent_seq_len
+        self.parent_blocks_per_step = parent_blocks_per_step
+        self.children_per_parent = parent_seq_len // seq_len
+        self.samples_per_step = parent_blocks_per_step * self.children_per_parent
+        self.seed = seed
+        self.num_parents = len(parent_dataset)
+        self.steps_per_epoch = self.num_parents // parent_blocks_per_step
+
+    def __len__(self) -> int:
+        return self.steps_per_epoch * self.samples_per_step
+
+    def parent_and_child(self, global_sample_index: int) -> tuple[int, int, int]:
+        if global_sample_index < 0:
+            raise IndexError("global sample indices must be non-negative")
+        optimizer_step, sample_in_step = divmod(
+            global_sample_index, self.samples_per_step
+        )
+        epoch, step_in_epoch = divmod(optimizer_step, self.steps_per_epoch)
+        child_index, parent_lane = divmod(
+            sample_in_step, self.parent_blocks_per_step
+        )
+        parent_position = step_in_epoch * self.parent_blocks_per_step + parent_lane
+        parent_index = deterministic_permute(
+            parent_position, self.num_parents, self.seed, epoch
+        )
+        return parent_index, child_index, epoch
+
+    def __getitem__(self, global_sample_index: int) -> Dict[str, torch.Tensor]:
+        parent_index, child_index, _ = self.parent_and_child(global_sample_index)
+        parent = self.parent_dataset[parent_index]["input_ids"]
+        if len(parent) != self.parent_seq_len:
+            raise ValueError(
+                f"Parent row {parent_index} has {len(parent)} tokens; expected "
+                f"exactly {self.parent_seq_len}"
+            )
+        start = child_index * self.seq_len
+        child = np.asarray(parent[start : start + self.seq_len], dtype=np.int64)
+        return {"input_ids": torch.from_numpy(child.copy())}
+
+
+class TopologyIndependentSampler(Sampler[int]):
+    """Map optimizer steps onto rank-local microbatches without data state."""
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        batch_size: int,
+        gradient_accumulation_steps: int,
+        samples_per_step: int,
+    ):
+        dimensions = {
+            "world_size": world_size,
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "samples_per_step": samples_per_step,
+        }
+        invalid = {name: value for name, value in dimensions.items() if value <= 0}
+        if invalid:
+            raise ValueError(f"Sampler dimensions must be positive: {invalid}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+        physical_samples = (
+            world_size * batch_size * gradient_accumulation_steps
+        )
+        if physical_samples != samples_per_step:
+            raise ValueError(
+                "Physical batch does not consume exactly one logical parent cohort: "
+                f"world_size({world_size}) * batch_size({batch_size}) * "
+                f"gradient_accumulation_steps({gradient_accumulation_steps}) = "
+                f"{physical_samples}, expected {samples_per_step}"
+            )
+        self.rank = rank
+        self.world_size = world_size
+        self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.samples_per_step = samples_per_step
+        self.start_step = 0
+
+    def set_optimizer_step(self, completed_steps: int) -> None:
+        if completed_steps < 0:
+            raise ValueError("completed_steps must be non-negative")
+        self.start_step = completed_steps
+
+    def __iter__(self) -> Iterator[int]:
+        optimizer_step = self.start_step
+        global_microbatch = self.world_size * self.batch_size
+        while True:
+            step_base = optimizer_step * self.samples_per_step
+            for microstep in range(self.gradient_accumulation_steps):
+                rank_base = (
+                    step_base
+                    + microstep * global_microbatch
+                    + self.rank * self.batch_size
+                )
+                yield from range(rank_base, rank_base + self.batch_size)
+            optimizer_step += 1
+
+
+class FixedValidationSampler(Sampler[int]):
+    """Partition one immutable validation set across arbitrary DP layouts.
+
+    The selected token rows already live in their final randomized order in a
+    ``MemmapTokenBlockDataset``.  This sampler only assigns every row to one
+    rank, without padding or duplication.  Creating a new iterator always
+    starts from row zero, so every validation call evaluates the same set.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        batch_size: int,
+        num_samples: int,
+    ):
+        dimensions = {
+            "world_size": world_size,
+            "batch_size": batch_size,
+            "num_samples": num_samples,
+        }
+        invalid = {name: value for name, value in dimensions.items() if value <= 0}
+        if invalid:
+            raise ValueError(f"Validation sampler dimensions must be positive: {invalid}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+        global_batch_size = world_size * batch_size
+        if num_samples % global_batch_size:
+            raise ValueError(
+                f"Fixed validation has {num_samples} sequences, which is not "
+                f"divisible by world_size({world_size}) * batch_size({batch_size}) "
+                f"= {global_batch_size}; padding would duplicate validation data"
+            )
+        self.rank = rank
+        self.world_size = world_size
+        self.batch_size = batch_size
+        self.num_samples = num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        global_batch_size = self.world_size * self.batch_size
+        for global_batch_start in range(0, self.num_samples, global_batch_size):
+            rank_start = global_batch_start + self.rank * self.batch_size
+            yield from range(rank_start, rank_start + self.batch_size)
+
+    def __len__(self) -> int:
+        return self.num_samples // self.world_size
+
+
+class TopologyIndependentDataLoader(StatefulDataLoader, Stateful):
+    """Dataloader whose resume cursor is reconstructed from optimizer step."""
+
+    def __init__(
+        self,
+        *args,
+        sampler: TopologyIndependentSampler,
+        data_plan: Dict[str, Any],
+        **kwargs,
+    ):
+        self.topology_sampler = sampler
+        self.data_plan = data_plan
+        super().__init__(*args, sampler=sampler, **kwargs)
+
+    def set_optimizer_step(self, completed_steps: int) -> None:
+        self.topology_sampler.set_optimizer_step(completed_steps)
+
+    def state_dict(self) -> Dict[str, Any]:
+        # This topology-independent plan is validation metadata, not a cursor.
+        # train_state.step remains the sole resume cursor.
+        payload = json.dumps(self.data_plan, sort_keys=True).encode("utf-8")
+        return {"data_plan": BytesIO(payload)}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        saved = state_dict["data_plan"]
+        saved.seek(0)
+        saved_plan = json.loads(saved.read().decode("utf-8"))
+        if saved_plan != self.data_plan:
+            raise ValueError(
+                "Deterministic dataloader plan changed across resume: "
+                f"saved={saved_plan}, current={self.data_plan}"
+            )
+
+
 def build_dataloader(
     dataset: IterableDataset,
     tokenizer: PreTrainedTokenizer,
@@ -554,10 +903,72 @@ def build_dataloader(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
+    gradient_accumulation_steps: int = 1,
+    seed: int = 42,
+    parent_blocks_per_step: int = 32,
 ):
-    dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
-    )
+    if isinstance(dataset, MemmapTokenBlockDataset):
+        virtual_dataset = DeterministicParentBlockDataset(
+            parent_dataset=dataset,
+            seq_len=seq_len,
+            parent_seq_len=dataset.seq_len,
+            parent_blocks_per_step=parent_blocks_per_step,
+            seed=seed,
+        )
+        sampler = TopologyIndependentSampler(
+            rank=rank,
+            world_size=world_size,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            samples_per_step=virtual_dataset.samples_per_step,
+        )
+        logger.info(
+            "Using topology-independent parent-block loader: "
+            f"parents/step={parent_blocks_per_step}, parent_len={dataset.seq_len}, "
+            f"seq_len={seq_len}, children/parent={virtual_dataset.children_per_parent}, "
+            f"steps/epoch={virtual_dataset.steps_per_epoch}"
+        )
+        loader_kwargs = {
+            "dataset": virtual_dataset,
+            "batch_size": batch_size,
+            "collate_fn": DataCollatorForLanguageModeling(
+                tokenizer=tokenizer, context_len=context_len, varlen=varlen
+            ),
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": persistent_workers,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+        data_plan = {
+            "schema_version": 1,
+            "manifest_sha256": dataset.manifest_sha256,
+            "num_parents": len(dataset),
+            "parent_seq_len": dataset.seq_len,
+            "seq_len": seq_len,
+            "parent_blocks_per_step": parent_blocks_per_step,
+            "seed": seed,
+            "context_len": context_len,
+            "varlen": varlen,
+        }
+        return TopologyIndependentDataLoader(
+            sampler=sampler, data_plan=data_plan, **loader_kwargs
+        )
+
+    # If the dataset is already pre-tokenized (has 'input_ids' column), bypass
+    # the on-the-fly tokenizer + cross-doc concatenation and stream one
+    # single-doc sequence per row. This is the "long-context-only" path.
+    cols = getattr(dataset, 'column_names', None) or []
+    if 'input_ids' in cols:
+        logger.info(f"build_dataloader: detected 'input_ids' column — using PreTokenizedIterableDataset (no cross-doc concat)")
+        dataset = PreTokenizedIterableDataset(
+            dataset=dataset, seq_len=seq_len, rank=rank, world_size=world_size
+        )
+    else:
+        dataset = OnlineTokenizedIterableDataset(
+            dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
+        )
     return ParallelAwareDataLoader(
         rank=rank,
         dataset=dataset,

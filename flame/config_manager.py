@@ -275,6 +275,25 @@ class JobConfig:
             help="Number of steps to accumulate gradients before updating parameters",
         )
         self.parser.add_argument(
+            "--training.parent_blocks_per_step",
+            type=int,
+            default=32,
+            help=(
+                "For dataset=parent_blocks, exact number of shuffled fixed-length "
+                "parent blocks consumed by every optimizer step"
+            ),
+        )
+        self.parser.add_argument(
+            "--training.allow_legacy_data_restart",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=(
+                "Allow a pre-parent-block checkpoint to start the deterministic "
+                "data plan at train_state.step. Model/optimizer resume stays exact, "
+                "but historical data continuity cannot be proven."
+            ),
+        )
+        self.parser.add_argument(
             "--training.steps",
             type=int,
             default=10000,
@@ -294,7 +313,10 @@ class JobConfig:
         self.parser.add_argument(
             "--training.dataset",
             default="HuggingFaceFW/fineweb-edu",
-            help="Dataset to use, with comma separated values",
+            help=(
+                "Dataset to use, with comma separated values. Use 'parent_blocks' "
+                "for a deterministic uint16 16k token store."
+            ),
         )
         self.parser.add_argument(
             "--training.dataset_name",
@@ -327,10 +349,20 @@ class JobConfig:
             help="Path to validation dataset on disk (saved via save_to_disk). When set, periodic validation is enabled.",
         )
         self.parser.add_argument(
+            "--training.fixed_val_parent_blocks_dir",
+            default=None,
+            help=(
+                "Opt-in immutable uint16 parent-block validation store. Every "
+                "validation call rereads all rows and partitions them without "
+                "duplication across the active DP layout. This does not change "
+                "the legacy --training.val_data_dir behavior."
+            ),
+        )
+        self.parser.add_argument(
             "--training.val_interval",
             type=int,
             default=500,
-            help="Run validation every N training steps (only when val_data_dir is set)",
+            help="Run validation every N training steps when either validation mode is enabled",
         )
         self.parser.add_argument(
             "--training.val_batches",
