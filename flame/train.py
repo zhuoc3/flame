@@ -25,6 +25,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.common.utils import prepare_position_ids
+from flame.completion import pending_job_cancellation_enabled
 from flame.components.checkpoint import (
     FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
@@ -1386,12 +1387,17 @@ def main(job_config: JobConfig):
             logger.info(f"wrote TRAINING_DONE marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
-            if job_name and user:
+            if job_name and user and pending_job_cancellation_enabled():
                 import subprocess
                 logger.info(f"scancel --state=PENDING --name={job_name} --user={user}")
                 subprocess.run(
                     ["scancel", "--state=PENDING", f"--name={job_name}", f"--user={user}"],
                     check=False, timeout=30,
+                )
+            elif job_name and user:
+                logger.info(
+                    "Pending-job cancellation disabled by "
+                    "FLAME_CANCEL_PENDING_ON_COMPLETE"
                 )
         except Exception as e:
             logger.warning(f"training-done cleanup failed: {e}")
