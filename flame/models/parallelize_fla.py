@@ -467,6 +467,23 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config, reshard_after_forward=not pp_enabled)
 
 
+def apply_singleton_fsdp(model: nn.Module, dp_mesh: DeviceMesh, job_config):
+    """Apply production mixed-precision FSDP2 to an initialized rank-1 model."""
+    if dp_mesh.size() != 1:
+        raise ValueError(
+            f"Singleton FSDP requires a size-1 mesh, got size {dp_mesh.size()}"
+        )
+    apply_fsdp(
+        model,
+        dp_mesh,
+        param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
+        pp_enabled=False,
+        cpu_offload=job_config.training.enable_cpu_offload,
+        reshard_after_forward_policy=job_config.training.fsdp_reshard_after_forward,
+    )
+
+
 def apply_ddp(
     model: nn.Module,
     dp_mesh: DeviceMesh,

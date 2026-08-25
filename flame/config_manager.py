@@ -349,6 +349,15 @@ class JobConfig:
             help="Path to validation dataset on disk (saved via save_to_disk). When set, periodic validation is enabled.",
         )
         self.parser.add_argument(
+            "--training.reset_val_iterator_each_eval",
+            action="store_true",
+            help=(
+                "Restart the legacy val_data_dir stream at every validation. "
+                "This makes the evaluated token prefix independent of SLURM "
+                "resume boundaries."
+            ),
+        )
+        self.parser.add_argument(
             "--training.fixed_val_parent_blocks_dir",
             default=None,
             help=(
@@ -424,6 +433,17 @@ class JobConfig:
 
             -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
             only `data_parallel_shard_degree` can be negative. 1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--training.force_singleton_fsdp",
+            action="store_true",
+            help="""
+            Apply FSDP2 mixed precision even when WORLD_SIZE=1. This keeps
+            persistent parameters, gradients, and optimizer state in FP32
+            while using training.mixed_precision_param for forward/backward.
+            The model is initialized before singleton FSDP is applied so
+            model-specific initializers see ordinary tensors rather than
+            DTensors. This option is rejected for WORLD_SIZE != 1.""",
         )
         self.parser.add_argument(
             "--training.enable_cpu_offload",

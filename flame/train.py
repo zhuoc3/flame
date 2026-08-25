@@ -21,6 +21,7 @@ import powerformer_hf  # noqa - registers PowerFormer with Auto*
 import powerssm  # noqa - registers PowerSSM with Auto*
 import torch
 from datasets import interleave_datasets, load_dataset, load_from_disk
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
@@ -46,7 +47,7 @@ from flame.data import (
     build_dataloader,
     shuffle,
 )
-from flame.models.parallelize_fla import parallelize_fla
+from flame.models.parallelize_fla import apply_singleton_fsdp, parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
 from torchtitan.components.checkpoint import CheckpointManager
@@ -138,8 +139,33 @@ def main(job_config: JobConfig):
     gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
     logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
 
-    # build meshes
-    world_mesh = parallel_dims.build_mesh(device_type=device_type)
+    # ParallelDims deliberately omits dimensions of size one, but singleton
+    # FSDP needs an explicit size-1 mesh for mixed precision.
+    if job_config.training.force_singleton_fsdp:
+        if world_size != 1:
+            raise ValueError(
+                "--training.force_singleton_fsdp requires WORLD_SIZE=1, "
+                f"got {world_size}"
+            )
+        if any(
+            degree != 1
+            for degree in (
+                parallel_dims.dp_replicate,
+                parallel_dims.dp_shard,
+                parallel_dims.cp,
+                parallel_dims.tp,
+                parallel_dims.pp,
+            )
+        ):
+            raise ValueError(
+                "--training.force_singleton_fsdp cannot be combined with "
+                "other parallelism degrees"
+            )
+        world_mesh = init_device_mesh(
+            device_type, (1,), mesh_dim_names=("dp_shard_cp",)
+        )
+    else:
+        world_mesh = parallel_dims.build_mesh(device_type=device_type)
     if parallel_dims.dp_enabled:
         dp_mesh = world_mesh["dp"]
         dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
@@ -660,6 +686,13 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+        if job_config.training.force_singleton_fsdp:
+            apply_singleton_fsdp(model, world_mesh, job_config)
+            logger.info(
+                "Applied singleton FSDP after model initialization "
+                f"(param={job_config.training.mixed_precision_param}, "
+                f"reduce={job_config.training.mixed_precision_reduce})"
+            )
         model.train()
 
         model_parts = [model]
@@ -914,9 +947,14 @@ def main(job_config: JobConfig):
     )
 
     # Validation evaluation function (works with FSDP/HSDP — model stays wrapped)
+    reset_val_iterator_each_eval = bool(
+        getattr(job_config.training, "reset_val_iterator_each_eval", False)
+    )
     val_iterator = (
         iter(val_dataloader)
-        if val_dataloader is not None and not fixed_validation
+        if val_dataloader is not None
+        and not fixed_validation
+        and not reset_val_iterator_each_eval
         else None
     )
 
@@ -929,17 +967,19 @@ def main(job_config: JobConfig):
         for m in model_parts:
             m.eval()
         current_val_iterator = (
-            iter(val_dataloader) if fixed_validation else val_iterator
+            iter(val_dataloader)
+            if fixed_validation or reset_val_iterator_each_eval
+            else val_iterator
         )
         with torch.no_grad():
             for _ in range(val_batches_per_rank):
                 try:
                     batch = next(current_val_iterator)
                 except StopIteration:
-                    if fixed_validation:
+                    if fixed_validation or reset_val_iterator_each_eval:
                         raise RuntimeError(
-                            "Fixed validation iterator ended before every selected "
-                            "sequence was evaluated"
+                            "Restarted validation iterator ended before every "
+                            "requested batch was evaluated"
                         )
                     val_iterator = iter(val_dataloader)
                     current_val_iterator = val_iterator
@@ -1279,17 +1319,30 @@ def main(job_config: JobConfig):
                     f"{color.magenta}[{str(train_state.elapsed).split('.')[0]:>8}<{str(eta).split('.')[0]:>8}]{color.reset}"
                 )
 
+            # Detect the time-limit window before starting validation. A full
+            # validation pass can be long enough to consume the checkpoint
+            # safety buffer by itself.
+            if (
+                slurm_end_time > 0
+                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
+            ):
+                time_limit_triggered = True
+
             # Periodic validation
             val_interval = getattr(job_config.training, "val_interval", 500)
             if (
-                val_dataloader is not None
+                not time_limit_triggered
+                and val_dataloader is not None
                 and train_state.step % val_interval == 0
             ):
                 run_validation(train_state.step)
 
             # Detect SLURM time-limit window; force a save now if we're inside
             # the buffer, then break out so the remaining chain-mates take over.
-            if slurm_end_time > 0 and time.time() > slurm_end_time - slurm_time_limit_buffer_s:
+            if (
+                slurm_end_time > 0
+                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
+            ):
                 time_limit_triggered = True
 
             checkpoint.save(
@@ -1386,7 +1439,15 @@ def main(job_config: JobConfig):
             logger.info(f"wrote TRAINING_DONE marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
-            if job_name and user:
+            disable_chain_scancel = os.environ.get(
+                "FLAME_DISABLE_CHAIN_SCANCEL", "0"
+            ).lower() in {"1", "true", "yes"}
+            if disable_chain_scancel:
+                logger.info(
+                    "FLAME_DISABLE_CHAIN_SCANCEL is set; parent launcher owns "
+                    "pending-chain cleanup"
+                )
+            elif job_name and user:
                 import subprocess
                 logger.info(f"scancel --state=PENDING --name={job_name} --user={user}")
                 subprocess.run(
