@@ -516,10 +516,16 @@ class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
         collate_fn: Callable,
         num_workers: int = 0,
         pin_memory: bool = False,
-        prefetch_factor: int = 2,
+        prefetch_factor: Optional[int] = 2,
         persistent_workers: bool = False,
         snapshot_every_n_steps: Optional[int] = 1,
     ):
+        # TorchData rejects multiprocessing-only knobs when num_workers=0.
+        # Normalize them here so seed-checkpoint and other single-process
+        # loaders can share the same configuration safely.
+        if num_workers == 0:
+            prefetch_factor = None
+            persistent_workers = False
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
