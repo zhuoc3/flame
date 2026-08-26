@@ -1,9 +1,13 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
-from flame.models.qwen38 import _fused_causal_lm_forward
+from flame.models.qwen38 import (
+    _fused_causal_lm_forward,
+    _install_safe_decay_initialization,
+)
 
 
 class RecordingCriterion:
@@ -38,6 +42,26 @@ class DummyCausalLM:
 
 
 class Qwen38ForwardTest(unittest.TestCase):
+    def test_real_model_post_init_keeps_decay_parameters_finite(self) -> None:
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        _install_safe_decay_initialization()
+        config = AutoConfig.from_pretrained(
+            Path(__file__).resolve().parents[2]
+            / "configs/baseline_qwen38_proportional_762m.json"
+        )
+        config.num_hidden_layers = 1
+        config.layer_types = ["linear_attention"]
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(config)
+            model.apply(lambda module: setattr(module, "_is_hf_initialized", False))
+        model.to_empty(device="cpu")
+        model.post_init()
+        layer = model.model.layers[0].linear_attn
+        self.assertTrue(torch.isfinite(layer.A_log).all())
+        self.assertGreaterEqual(layer.A_log.exp().min().item(), 0.01)
+        torch.testing.assert_close(layer.dt_bias, torch.ones_like(layer.dt_bias))
+
     def test_training_shifts_labels_and_does_not_materialize_logits(self) -> None:
         model = DummyCausalLM()
         labels = torch.tensor([[1, 2, 3, 4]])

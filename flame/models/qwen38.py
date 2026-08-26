@@ -46,8 +46,7 @@ def _install_safe_decay_initialization() -> None:
     def safe_init_weights(self, module):
         current(self, module)
         if isinstance(module, Qwen3_5GatedDeltaNet):
-            init.copy_(
-                module.A_log,
+            module.A_log.copy_(
                 torch.empty_like(module.A_log).uniform_(0.01, 16).log_(),
             )
             init.constant_(module.dt_bias, 1.0)
