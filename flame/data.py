@@ -26,6 +26,16 @@ from transformers import PreTrainedTokenizer
 from torchtitan.tools.logging import logger
 
 
+def iter_preserving_torch_cpu_rng(loader):
+    """Create a loader iterator without perturbing the training RNG stream."""
+
+    state = torch.get_rng_state()
+    try:
+        return iter(loader)
+    finally:
+        torch.set_rng_state(state)
+
+
 class BufferShuffledIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -166,12 +176,20 @@ class OnlineTokenizedIterableDataset(IterableDataset):
         self.tokenizer = tokenizer
 
         self.data = dataset.shard(world_size, rank)
+        self._initial_data_state = deepcopy(self.data.state_dict())
         self.seq_len = seq_len
         self.rank = rank
         self.world_size = world_size
 
         self.states = None
         self.tokens = []
+
+    def reset(self) -> None:
+        """Return the token stream to its exact initial prefix."""
+
+        self.states = None
+        self.tokens = []
+        self.data.load_state_dict(deepcopy(self._initial_data_state))
 
     def __iter__(self):
         if self.states is not None:

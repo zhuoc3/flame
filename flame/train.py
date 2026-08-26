@@ -17,8 +17,9 @@ _powerdata_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_powerdata_dir))
 
 import fla  # noqa
-import powerformer_hf  # noqa - registers PowerFormer with Auto*
-import powerssm  # noqa - registers PowerSSM with Auto*
+if os.environ.get("FLAME_SKIP_CUSTOM_MODEL_REGISTRATION") != "1":
+    import powerformer_hf  # noqa - registers PowerFormer with Auto*
+    import powerssm  # noqa - registers PowerSSM with Auto*
 import torch
 from datasets import interleave_datasets, load_dataset, load_from_disk
 from torch.distributed.device_mesh import init_device_mesh
@@ -47,6 +48,7 @@ from flame.data import (
     MemmapTokenBlockDataset,
     TopologyIndependentDataLoader,
     build_dataloader,
+    iter_preserving_torch_cpu_rng,
     shuffle,
 )
 from flame.models.parallelize_fla import apply_singleton_fsdp, parallelize_fla
@@ -900,6 +902,15 @@ def main(job_config: JobConfig):
     # final RNG mutation before resumed data/model work begins.
     metric_logger = build_metrics_processor(job_config, parallel_dims)
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    # Constructing a torch DataLoader iterator consumes the global CPU RNG even
+    # when the underlying sampler is deterministic.  Preserve the just-loaded
+    # RNG across iterator reconstruction so a resumed run has exactly the same
+    # random stream as an uninterrupted run.
+    restored_random_state = (
+        checkpoint.states[RANDOM_STATE_KEY].state_dict()
+        if checkpoint_loaded and RANDOM_STATE_KEY in checkpoint.states
+        else None
+    )
     if qwen38_runtime_metadata is not None and checkpoint_loaded:
         from flame.models.qwen38 import assert_qwen38_model_finite
 
@@ -945,7 +956,7 @@ def main(job_config: JobConfig):
                 global_max_loss=train_state.global_max_losses[idx],
             )
 
-    data_iterator = iter(dataloader)
+    data_iterator = iter_preserving_torch_cpu_rng(dataloader)
 
     train_context = dist_utils.get_train_context(
         parallel_dims.loss_parallel_enabled,
@@ -994,12 +1005,14 @@ def main(job_config: JobConfig):
         getattr(job_config.training, "reset_val_iterator_each_eval", False)
     )
     val_iterator = (
-        iter(val_dataloader)
+        iter_preserving_torch_cpu_rng(val_dataloader)
         if val_dataloader is not None
         and not fixed_validation
         and not reset_val_iterator_each_eval
         else None
     )
+    if restored_random_state is not None:
+        checkpoint.states[RANDOM_STATE_KEY].load_state_dict(restored_random_state)
 
     def run_validation(step):
         nonlocal val_iterator
@@ -1009,8 +1022,15 @@ def main(job_config: JobConfig):
         val_tokens = 0
         for m in model_parts:
             m.eval()
+        if reset_val_iterator_each_eval and not fixed_validation:
+            reset_dataset = getattr(val_dataloader.dataset, "reset", None)
+            if not callable(reset_dataset):
+                raise RuntimeError(
+                    "reset_val_iterator_each_eval requires a resettable validation dataset"
+                )
+            reset_dataset()
         current_val_iterator = (
-            iter(val_dataloader)
+            iter_preserving_torch_cpu_rng(val_dataloader)
             if fixed_validation or reset_val_iterator_each_eval
             else val_iterator
         )
@@ -1024,7 +1044,7 @@ def main(job_config: JobConfig):
                             "Restarted validation iterator ended before every "
                             "requested batch was evaluated"
                         )
-                    val_iterator = iter(val_dataloader)
+                    val_iterator = iter_preserving_torch_cpu_rng(val_dataloader)
                     current_val_iterator = val_iterator
                     batch = next(current_val_iterator)
                 input_ids = batch["input_ids"].to(device_type)
@@ -1087,7 +1107,7 @@ def main(job_config: JobConfig):
         test_losses = []
         for m in model_parts:
             m.eval()
-        test_iterator = iter(test_dataloader)
+        test_iterator = iter_preserving_torch_cpu_rng(test_dataloader)
         with torch.no_grad():
             for _ in range(test_batches_per_rank):
                 try:

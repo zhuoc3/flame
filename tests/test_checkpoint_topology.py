@@ -24,6 +24,7 @@ from flame.components.checkpoint import (
     inspect_checkpoint_topology,
 )
 from flame.config_manager import JobConfig
+from flame.data import iter_preserving_torch_cpu_rng
 
 
 def _hsdp_4x2() -> ParallelTopology:
@@ -35,6 +36,16 @@ def _hsdp_4x4() -> ParallelTopology:
 
 
 class CheckpointTopologyTest(unittest.TestCase):
+    def test_dataloader_iterator_does_not_advance_training_rng(self) -> None:
+        loader = torch.utils.data.DataLoader(torch.arange(8), batch_size=2)
+        torch.manual_seed(123)
+        expected = torch.rand(4)
+        torch.manual_seed(123)
+        iterator = iter_preserving_torch_cpu_rng(loader)
+        actual = torch.rand(4)
+        self.assertEqual(next(iterator).tolist(), [0, 1])
+        torch.testing.assert_close(actual, expected)
+
     def test_logger_initializes_before_rng_checkpoint_restore(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "flame/train.py").read_text()
         logger_init = source.index(
@@ -46,6 +57,28 @@ class CheckpointTopologyTest(unittest.TestCase):
         logger_config = source.index("metric_logger.log_config(")
         self.assertLess(logger_init, checkpoint_load)
         self.assertLess(checkpoint_load, logger_config)
+
+    def test_resume_reapplies_rng_after_iterator_reconstruction(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "flame/train.py").read_text()
+        checkpoint_load = source.index(
+            "checkpoint_loaded = checkpoint.load(step=requested_load_step)"
+        )
+        rng_snapshot = source.index(
+            "restored_random_state = (", checkpoint_load
+        )
+        train_iterator = source.index(
+            "data_iterator = iter_preserving_torch_cpu_rng(dataloader)", rng_snapshot
+        )
+        val_iterator = source.index("val_iterator = (", train_iterator)
+        rng_restore = source.index(
+            "checkpoint.states[RANDOM_STATE_KEY].load_state_dict(", val_iterator
+        )
+        validation = source.index("def run_validation(step):", rng_restore)
+        self.assertLess(checkpoint_load, rng_snapshot)
+        self.assertLess(rng_snapshot, train_iterator)
+        self.assertLess(train_iterator, val_iterator)
+        self.assertLess(val_iterator, rng_restore)
+        self.assertLess(rng_restore, validation)
 
     def test_rank_local_random_state_roundtrip_and_pinned_staging(self) -> None:
         random.seed(17)

@@ -400,6 +400,12 @@ class JobConfig:
             help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
         )
         self.parser.add_argument(
+            "--training.pin_memory",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Use page-locked host memory for DataLoader batches.",
+        )
+        self.parser.add_argument(
             "--training.prefetch_factor",
             type=int,
             default=2,
