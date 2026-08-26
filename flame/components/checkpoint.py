@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import random
 from dataclasses import dataclass, field
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+import numpy as np
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.stateful import Stateful
@@ -20,12 +22,51 @@ PARALLEL_TOPOLOGY_STATE_KEY = "parallel_topology"
 PARALLEL_TOPOLOGY_SCHEMA_VERSION = 1
 FIXED_VALIDATION_STATE_KEY = "fixed_validation_plan"
 FIXED_TEST_STATE_KEY = "fixed_test_plan"
+RANDOM_STATE_KEY = "random_state"
 
 
 def _scalar_int(value: Any) -> int:
     """Convert a scalar DCP value to an int without assuming its container."""
 
     return int(value.item()) if hasattr(value, "item") else int(value)
+
+
+class RandomState(Stateful):
+    """Rank-local Python, NumPy, CPU, and active-CUDA RNG checkpoint state."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank = int(rank)
+
+    def state_dict(self) -> Dict[str, BytesIO]:
+        payload = BytesIO()
+        torch.save(
+            {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": (
+                    torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                ),
+            },
+            payload,
+        )
+        payload.seek(0)
+        return {f"rank_{self.rank}": payload}
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        key = f"rank_{self.rank}"
+        if key not in state_dict:
+            raise RuntimeError(f"checkpoint is missing RNG state for {key}")
+        payload = state_dict[key]
+        payload.seek(0)
+        loaded = torch.load(payload, map_location="cpu", weights_only=False)
+        random.setstate(loaded["python"])
+        np.random.set_state(loaded["numpy"])
+        torch.set_rng_state(loaded["torch_cpu"])
+        if loaded["torch_cuda"] is not None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("checkpoint has CUDA RNG state but CUDA is unavailable")
+            torch.cuda.set_rng_state(loaded["torch_cuda"])
 
 
 @dataclass(frozen=True)

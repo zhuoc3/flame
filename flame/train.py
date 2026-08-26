@@ -30,10 +30,12 @@ from flame.components.checkpoint import (
     FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
     PARALLEL_TOPOLOGY_STATE_KEY,
+    RANDOM_STATE_KEY,
     FixedTestPlanState,
     FixedValidationPlanState,
     ParallelTopology,
     ParallelTopologyState,
+    RandomState,
     TrainState,
     inspect_checkpoint_topology,
 )
@@ -590,6 +592,17 @@ def main(job_config: JobConfig):
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
+    qwen38_runtime_metadata = None
+    qwen38_model_metadata = None
+    if getattr(model_config, "model_type", None) == "qwen3_5_text":
+        from flame.models.qwen38 import configure_qwen38_runtime
+
+        if job_config.activation_checkpoint.mode != "none":
+            raise RuntimeError(
+                "Qwen3.8 production configuration requires "
+                "--activation_checkpoint.mode none"
+            )
+        qwen38_runtime_metadata = configure_qwen38_runtime()
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
@@ -619,6 +632,10 @@ def main(job_config: JobConfig):
     )
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(model_config)
+        if qwen38_runtime_metadata is not None:
+            from flame.models.qwen38 import prepare_qwen38_model
+
+            qwen38_model_metadata = prepare_qwen38_model(model)
         if (
             getattr(model_config, "fuse_cross_entropy", False)
             and FusedLinearCrossEntropyLoss is not None
@@ -628,6 +645,11 @@ def main(job_config: JobConfig):
             )
         # defer weight initialization until after parallelisms are applied
         model.apply(lambda m: setattr(m, "_is_hf_initialized", False))
+    if qwen38_runtime_metadata is not None:
+        logger.info(
+            "Configured production Qwen3.8 runtime: "
+            f"{json.dumps({**qwen38_runtime_metadata, **qwen38_model_metadata}, sort_keys=True)}"
+        )
     logger.info(f"{color.blue}\n{model}{color.reset}\n")
 
     # Build the collection of model converters. No-op if `model.converters` empty
@@ -686,6 +708,10 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+        if qwen38_runtime_metadata is not None:
+            from flame.models.qwen38 import assert_qwen38_model_finite
+
+            assert_qwen38_model_finite(model, "post_init")
         if job_config.training.force_singleton_fsdp:
             apply_singleton_fsdp(model, world_mesh, job_config)
             logger.info(
@@ -753,6 +779,10 @@ def main(job_config: JobConfig):
         "train_state": train_state,
         PARALLEL_TOPOLOGY_STATE_KEY: parallel_topology_state,
     }
+    if qwen38_runtime_metadata is not None:
+        checkpoint_states[RANDOM_STATE_KEY] = RandomState(
+            torch.distributed.get_rank()
+        )
     if fixed_validation_plan_state is not None:
         checkpoint_states[FIXED_VALIDATION_STATE_KEY] = fixed_validation_plan_state
     if fixed_test_plan_state is not None:
@@ -865,6 +895,10 @@ def main(job_config: JobConfig):
                 )
 
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    if qwen38_runtime_metadata is not None and checkpoint_loaded:
+        from flame.models.qwen38 import assert_qwen38_model_finite
+
+        assert_qwen38_model_finite(model_parts[0], "checkpoint load")
     # A legacy load temporarily omitted this missing key. All subsequent
     # checkpoints record the current topology.
     if checkpoint.enable_checkpoint:

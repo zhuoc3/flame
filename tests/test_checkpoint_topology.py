@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 import warnings
@@ -5,6 +6,7 @@ from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed._state_dict_utils import _copy_state_dict, _create_cpu_state_dict
@@ -17,6 +19,7 @@ from flame.components.checkpoint import (
     FixedValidationPlanState,
     ParallelTopology,
     ParallelTopologyState,
+    RandomState,
     TrainState,
     inspect_checkpoint_topology,
 )
@@ -32,6 +35,32 @@ def _hsdp_4x4() -> ParallelTopology:
 
 
 class CheckpointTopologyTest(unittest.TestCase):
+    def test_rank_local_random_state_roundtrip_and_pinned_staging(self) -> None:
+        random.seed(17)
+        np.random.seed(18)
+        torch.manual_seed(19)
+        state = RandomState(rank=0)
+        state_dict = {"random_state": state.state_dict()}
+        cpu_state = _create_cpu_state_dict(
+            state_dict,
+            pin_memory=False,
+            share_memory=False,
+        )
+        copied = _copy_state_dict(state_dict, cpu_state, non_blocking=False)
+
+        expected = (random.random(), np.random.random(), torch.rand(1))
+        random.seed(117)
+        np.random.seed(118)
+        torch.manual_seed(119)
+        state.load_state_dict(copied["random_state"])
+        actual = (random.random(), np.random.random(), torch.rand(1))
+
+        self.assertEqual(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+        torch.testing.assert_close(actual[2], expected[2])
+        with self.assertRaisesRegex(RuntimeError, "rank_1"):
+            RandomState(rank=1).load_state_dict(copied["random_state"])
+
     def test_train_state_elapsed_supports_pinned_staging_and_legacy_load(self) -> None:
         expected = timedelta(days=2, seconds=3, microseconds=456789)
         state = TrainState(step=7, elapsed=expected)
