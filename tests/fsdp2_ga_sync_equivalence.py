@@ -11,7 +11,36 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor.debug import CommDebugMode
+from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import TorchDispatchMode
+
+
+class CollectiveCounter(TorchDispatchMode):
+    """Count reduce-scatter ops without CommDebugMode's module hooks.
+
+    PyTorch 2.7's CommDebugMode module tracker crashes on nested composable
+    FSDP modules (its forward hook pops an already-empty parent stack). This
+    dispatch-only counter observes the same decomposed functional collectives
+    without installing any module hooks.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.counts: dict[str, int] = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # Let DTensor dispatch decompose into the underlying functional
+        # collectives, which this mode then observes on re-entry.
+        if any(t == DTensor for t in types):
+            return NotImplemented
+        out = func(*args, **(kwargs or {}))
+        name = str(func._overloadpacket)
+        if "reduce_scatter" in name:
+            self.counts[name] = self.counts.get(name, 0) + 1
+        return out
+
+    def get_comm_counts(self) -> dict[str, int]:
+        return dict(self.counts)
 
 
 class TinyModel(nn.Module):
@@ -55,7 +84,7 @@ def main() -> None:
     for update in range(2):
         optimizer.zero_grad()
         losses = []
-        comm_mode = CommDebugMode()
+        comm_mode = CollectiveCounter()
         with comm_mode:
             for microstep in range(accumulation):
                 model.set_requires_gradient_sync(
