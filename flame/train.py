@@ -54,6 +54,11 @@ from flame.data import (
 from flame.models.parallelize_fla import apply_singleton_fsdp, parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
+from flame.training_control import (
+    partial_stop_reason,
+    publish_training_done,
+    should_run_terminal_validation,
+)
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
 from torchtitan.components.loss import build_cross_entropy_loss
@@ -1165,7 +1170,10 @@ def main(job_config: JobConfig):
     # when run outside SLURM (SLURM_JOB_END_TIME=0 → no-op).
     slurm_end_time = int(os.environ.get("SLURM_JOB_END_TIME", "0"))
     slurm_time_limit_buffer_s = int(os.environ.get("SLURM_TIME_LIMIT_BUFFER_S", "120"))
+    stop_request_file = os.environ.get("FLAME_STOP_REQUEST_FILE")
     time_limit_triggered = False
+    stop_reason = None
+    last_validated_step = None
 
     with (
         maybe_enable_profiling(
@@ -1385,10 +1393,12 @@ def main(job_config: JobConfig):
             # Detect the time-limit window before starting validation. A full
             # validation pass can be long enough to consume the checkpoint
             # safety buffer by itself.
-            if (
-                slurm_end_time > 0
-                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
-            ):
+            stop_reason = partial_stop_reason(
+                stop_request_file=stop_request_file,
+                slurm_end_time=slurm_end_time,
+                slurm_time_limit_buffer_s=slurm_time_limit_buffer_s,
+            )
+            if stop_reason is not None:
                 time_limit_triggered = True
 
             # Periodic validation
@@ -1399,14 +1409,18 @@ def main(job_config: JobConfig):
                 and train_state.step % val_interval == 0
             ):
                 run_validation(train_state.step)
+                last_validated_step = train_state.step
 
             # Detect SLURM time-limit window; force a save now if we're inside
             # the buffer, then break out so the remaining chain-mates take over.
-            if (
-                slurm_end_time > 0
-                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
-            ):
-                time_limit_triggered = True
+            if not time_limit_triggered:
+                stop_reason = partial_stop_reason(
+                    stop_request_file=stop_request_file,
+                    slurm_end_time=slurm_end_time,
+                    slurm_time_limit_buffer_s=slurm_time_limit_buffer_s,
+                )
+                if stop_reason is not None:
+                    time_limit_triggered = True
 
             checkpoint.save(
                 train_state.step,
@@ -1460,7 +1474,7 @@ def main(job_config: JobConfig):
             if time_limit_triggered:
                 if torch.distributed.get_rank() == 0:
                     logger.info(
-                        f"SLURM time limit within {slurm_time_limit_buffer_s}s — "
+                        f"Training stop requested ({stop_reason}) — "
                         f"saved checkpoint at step {train_state.step} and exiting cleanly for chain resume"
                     )
                 break
@@ -1482,8 +1496,25 @@ def main(job_config: JobConfig):
     training_completed = (
         not time_limit_triggered and train_state.step >= _effective_max_steps
     )
+    if should_run_terminal_validation(
+        training_completed=training_completed,
+        validation_enabled=val_dataloader is not None,
+        last_validated_step=last_validated_step,
+        current_step=train_state.step,
+    ):
+        run_validation(train_state.step)
+        last_validated_step = train_state.step
+
+    fixed_test_completed = False
     if training_completed and test_dataloader is not None:
         run_fixed_test(train_state.step)
+        fixed_test_completed = True
+
+    # Forced partial/final saves above are synchronous. Explicitly close the
+    # manager on every clean exit so background workers and retention complete
+    # before a durable completion marker can become visible.
+    checkpoint.close()
+    torch.distributed.barrier()
 
     # Training-done marker + chain-mate scancel. Mirrors the synthetic trainer's
     # behavior: when the loop runs to completion (not broken out of for a
@@ -1497,8 +1528,13 @@ def main(job_config: JobConfig):
     ):
         try:
             done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
-            with open(done_path, "w") as f:
-                f.write(f"completed {train_state.step} steps at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+            publish_training_done(
+                job_config.job.dump_folder,
+                step=train_state.step,
+                effective_max_steps=_effective_max_steps,
+                final_validation_step=last_validated_step,
+                fixed_test_completed=fixed_test_completed,
+            )
             logger.info(f"wrote TRAINING_DONE marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
