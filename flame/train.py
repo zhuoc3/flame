@@ -1137,9 +1137,11 @@ def main(job_config: JobConfig):
             ga_steps = job_config.training.gradient_accumulation_steps
             # do gradient accumulation if enabled
             for ga_step in range(ga_steps):
-                # Skip redundant DDP all-reduce on non-final micro-batches.
-                # The final micro-batch syncs the accumulated gradients.
-                if parallel_dims.dp_replicate_enabled and ga_steps > 1:
+                # Accumulate locally on non-final micro-batches and communicate
+                # the accumulated gradient once on the final micro-batch. FSDP2's
+                # API covers reduce-scatter (and HSDP all-reduce); composable DDP
+                # exposes the same method for its all-reduce.
+                if parallel_dims.dp_enabled and ga_steps > 1:
                     model.set_requires_gradient_sync(ga_step == ga_steps - 1)
 
                 # get batch
