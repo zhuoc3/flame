@@ -889,6 +889,11 @@ def main(job_config: JobConfig):
         "model/num_parameters": model_param_count,
         "model/num_flops_per_token": num_flops_per_token,
         "model/config": model_config.to_json_string() if hasattr(model_config, 'to_json_string') else str(model_config),
+        "sentinel/restored_generation": int(
+            os.environ.get("SENTINEL_RESTORED_GENERATION", "-1")
+        ),
+        "sentinel/restart_count": int(os.environ.get("SLURM_RESTART_COUNT", "0")),
+        "sentinel/chain_index": int(os.environ.get("SENTINEL_CHAIN_INDEX", "0")),
     })
 
     # plot losses loaded from checkpoint (if any) to TensorBoard
