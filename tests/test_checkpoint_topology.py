@@ -1,11 +1,13 @@
 import tempfile
 import unittest
 import warnings
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed._state_dict_utils import _copy_state_dict, _create_cpu_state_dict
 
 from flame.components.checkpoint import (
     FIXED_TEST_STATE_KEY,
@@ -15,6 +17,7 @@ from flame.components.checkpoint import (
     FixedValidationPlanState,
     ParallelTopology,
     ParallelTopologyState,
+    TrainState,
     inspect_checkpoint_topology,
 )
 from flame.config_manager import JobConfig
@@ -29,6 +32,27 @@ def _hsdp_4x4() -> ParallelTopology:
 
 
 class CheckpointTopologyTest(unittest.TestCase):
+    def test_train_state_elapsed_supports_pinned_staging_and_legacy_load(self) -> None:
+        expected = timedelta(days=2, seconds=3, microseconds=456789)
+        state = TrainState(step=7, elapsed=expected)
+        state_dict = {"train_state": state.state_dict()}
+
+        self.assertIsInstance(state_dict["train_state"]["elapsed"], float)
+        cpu_state = _create_cpu_state_dict(
+            state_dict,
+            pin_memory=False,
+            share_memory=False,
+        )
+        copied = _copy_state_dict(state_dict, cpu_state, non_blocking=False)
+        restored = TrainState()
+        restored.load_state_dict(copied["train_state"])
+        self.assertEqual(restored.elapsed, expected)
+
+        legacy = state.state_dict()
+        legacy["elapsed"] = expected
+        restored.load_state_dict(legacy)
+        self.assertEqual(restored.elapsed, expected)
+
     def test_fixed_test_is_opt_in_and_legacy_validation_defaults_are_unchanged(
         self,
     ) -> None:

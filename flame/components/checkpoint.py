@@ -291,7 +291,10 @@ class TrainState(Stateful):
             "step": torch.tensor(self.step, dtype=torch.int32),
             "skipped_step": torch.tensor(self.skipped_step, dtype=torch.int32),
             "token": torch.tensor(self.token, dtype=torch.int64),
-            "elapsed": self.elapsed,
+            # Pinned-memory async staging only accepts DCP primitive/container
+            # types. timedelta is supported by synchronous DCP via pickling but
+            # rejected by torch.distributed._state_dict_utils._copy_state_dict.
+            "elapsed": self.elapsed.total_seconds(),
             "global_avg_losses": global_avg_losses_bytes,
             "global_max_losses": global_max_losses_bytes,
             "log_steps": log_steps_bytes,
@@ -301,7 +304,15 @@ class TrainState(Stateful):
         self.step = state_dict["step"].item()
         self.skipped_step = state_dict.get("skipped_step", 0).item()
         self.token = state_dict["token"].item()
-        self.elapsed = state_dict["elapsed"]
+        elapsed = state_dict["elapsed"]
+        # Keep compatibility with checkpoints written before elapsed was
+        # normalized for pinned-memory staging.
+        elapsed_seconds = elapsed.item() if hasattr(elapsed, "item") else elapsed
+        self.elapsed = (
+            elapsed
+            if isinstance(elapsed, timedelta)
+            else timedelta(seconds=float(elapsed_seconds))
+        )
         state_dict["global_avg_losses"].seek(0)
         self.global_avg_losses = torch.load(
             state_dict["global_avg_losses"], weights_only=False
