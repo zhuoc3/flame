@@ -26,7 +26,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
-from fla.ops.common.utils import prepare_position_ids
+try:
+    # FLA <=0.1 exposed this helper below ``ops.common``.  FLA 0.5, used by
+    # Qwen3.8, moved the same public helper to ``ops.utils``.
+    from fla.ops.common.utils import prepare_position_ids
+except ModuleNotFoundError as exc:
+    if exc.name not in {"fla.ops.common", "fla.ops.common.utils"}:
+        raise
+    from fla.ops.utils import prepare_position_ids
 from flame.components.checkpoint import (
     FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
