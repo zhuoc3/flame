@@ -894,6 +894,11 @@ def main(job_config: JobConfig):
                     f"Checkpoint topology matches current topology: {current_topology}"
                 )
 
+    # Initialize external loggers before restoring checkpoint RNG.  W&B and
+    # similar clients are not part of the numerical training state and may
+    # consume process RNG during setup; checkpoint restoration must be the
+    # final RNG mutation before resumed data/model work begins.
+    metric_logger = build_metrics_processor(job_config, parallel_dims)
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
     if qwen38_runtime_metadata is not None and checkpoint_loaded:
         from flame.models.qwen38 import assert_qwen38_model_finite
@@ -910,7 +915,6 @@ def main(job_config: JobConfig):
             f"step {train_state.step:,}"
             + (" after checkpoint load" if checkpoint_loaded else "")
         )
-    metric_logger = build_metrics_processor(job_config, parallel_dims)
     # Set dependent attributes for metric_logger
     metric_logger.num_flops_per_token = num_flops_per_token
     metric_logger.optimizers = optimizers  # Pass optimizers if needed by logger logic

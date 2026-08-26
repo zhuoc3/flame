@@ -35,6 +35,18 @@ def _hsdp_4x4() -> ParallelTopology:
 
 
 class CheckpointTopologyTest(unittest.TestCase):
+    def test_logger_initializes_before_rng_checkpoint_restore(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "flame/train.py").read_text()
+        logger_init = source.index(
+            "metric_logger = build_metrics_processor(job_config, parallel_dims)"
+        )
+        checkpoint_load = source.index(
+            "checkpoint_loaded = checkpoint.load(step=requested_load_step)"
+        )
+        logger_config = source.index("metric_logger.log_config(")
+        self.assertLess(logger_init, checkpoint_load)
+        self.assertLess(checkpoint_load, logger_config)
+
     def test_rank_local_random_state_roundtrip_and_pinned_staging(self) -> None:
         random.seed(17)
         np.random.seed(18)
