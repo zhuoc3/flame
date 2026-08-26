@@ -194,6 +194,9 @@ class TrainingControlTest(unittest.TestCase):
         stop_boundary = source.index("stop_reason = partial_stop_reason(", loop)
         periodic_validation = source.index("# Periodic validation", stop_boundary)
         forced_save = source.index("checkpoint.save(", periodic_validation)
+        post_save_check = source.index("post_save_stop_reason = partial_stop_reason(", forced_save)
+        post_save_rollover = source.index("if time_limit_triggered:", post_save_check)
+        archive = source.index("# Model-only archive snapshot", post_save_rollover)
         completion_state = source.index("training_completed = (", forced_save)
         terminal_validation = source.index("if should_run_terminal_validation(")
         fixed_test = source.index("if training_completed and test_dataloader is not None:")
@@ -216,6 +219,13 @@ class TrainingControlTest(unittest.TestCase):
         self.assertIn(
             "or time_limit_triggered",
             source[forced_save : source.index("\n            )", forced_save)],
+        )
+        self.assertLess(forced_save, post_save_check)
+        self.assertLess(post_save_check, post_save_rollover)
+        self.assertLess(post_save_rollover, archive)
+        self.assertIn(
+            "time_limit_triggered = True",
+            source[post_save_check:post_save_rollover],
         )
         self.assertIn(
             "not time_limit_triggered",

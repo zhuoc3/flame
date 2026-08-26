@@ -1449,6 +1449,31 @@ def main(job_config: JobConfig):
                 force=(train_state.step == _effective_max_steps) or time_limit_triggered,
             )
 
+            # A forced synchronous save can itself consume enough of the
+            # rollover margin that terminal validation is no longer safe to
+            # admit. Recheck after the checkpoint commit; a successor can load
+            # this exact step and perform terminal validation with a fresh
+            # allocation.
+            if not time_limit_triggered:
+                post_save_stop_reason = partial_stop_reason(
+                    stop_request_file=stop_request_file,
+                    slurm_end_time=slurm_end_time,
+                    slurm_time_limit_buffer_s=slurm_time_limit_buffer_s,
+                    test_stop_after_step=test_stop_after_step,
+                    current_step=train_state.step,
+                )
+                if post_save_stop_reason is not None:
+                    stop_reason = post_save_stop_reason
+                    time_limit_triggered = True
+
+            if time_limit_triggered:
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        f"Training stop requested ({stop_reason}) — "
+                        f"saved checkpoint at step {train_state.step} and exiting cleanly for chain resume"
+                    )
+                break
+
             # Model-only archive snapshot. Survives `keep_latest_k` purge so the
             # full training trajectory (not just the last K steps) stays on
             # disk. Archive cadence is set via env var FLAME_ARCHIVE_EVERY_STEPS
@@ -1492,14 +1517,6 @@ def main(job_config: JobConfig):
                         logger.warning(
                             f"Archive save at step {train_state.step} failed: {_e}"
                         )
-
-            if time_limit_triggered:
-                if torch.distributed.get_rank() == 0:
-                    logger.info(
-                        f"Training stop requested ({stop_reason}) — "
-                        f"saved checkpoint at step {train_state.step} and exiting cleanly for chain resume"
-                    )
-                break
 
             # signal the profiler that the next profiling step has started
             if torch_profiler:
