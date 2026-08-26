@@ -172,6 +172,17 @@ class OnlineTokenizedIterableDataset(IterableDataset):
 
         self.states = None
         self.tokens = []
+        # Keep an immutable cursor for validation streams that must evaluate
+        # the same rank-local token prefix every time. Merely clearing
+        # ``self.states`` is insufficient: Hugging Face IterableDataset keeps
+        # its own loaded/advanced cursor internally.
+        self._initial_data_state = deepcopy(self.data.state_dict())
+
+    def reset(self):
+        """Rewind this online-tokenized stream to its construction state."""
+        self.data.load_state_dict(deepcopy(self._initial_data_state))
+        self.states = None
+        self.tokens = []
 
     def __iter__(self):
         if self.states is not None:

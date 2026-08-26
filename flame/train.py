@@ -432,6 +432,7 @@ def main(job_config: JobConfig):
     fixed_validation = False
     fixed_validation_tokens = None
     fixed_validation_plan_state = None
+    val_tok_dataset = None
     val_batches_per_rank = job_config.training.val_batches
     val_data_dir = getattr(job_config.training, "val_data_dir", None)
     fixed_val_dir = getattr(
@@ -962,6 +963,13 @@ def main(job_config: JobConfig):
         nonlocal val_iterator
         if val_dataloader is None:
             return
+        if reset_val_iterator_each_eval and not fixed_validation:
+            if val_tok_dataset is None:
+                raise RuntimeError(
+                    "Legacy validation reset requested without an online-tokenized dataset"
+                )
+            val_tok_dataset.reset()
+            logger.info("Reset legacy validation stream to its immutable initial state")
         val_losses = []
         val_tokens = 0
         for m in model_parts:
