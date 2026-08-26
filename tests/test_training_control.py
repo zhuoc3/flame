@@ -7,6 +7,7 @@ from unittest import mock
 from flame.training_control import (
     partial_stop_reason,
     publish_training_done,
+    resolve_test_stop_after_step,
     should_run_terminal_validation,
 )
 
@@ -50,6 +51,55 @@ class TrainingControlTest(unittest.TestCase):
                 now=901,
             ),
             "SLURM time limit within 100s",
+        )
+
+    def test_test_stop_is_strictly_gated_and_validated(self):
+        self.assertIsNone(
+            resolve_test_stop_after_step(
+                None, allow_test_max_steps=None, effective_max_steps=55
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "only allowed"):
+            resolve_test_stop_after_step(
+                "51", allow_test_max_steps=None, effective_max_steps=55
+            )
+        with self.assertRaisesRegex(RuntimeError, "only allowed"):
+            resolve_test_stop_after_step(
+                "51", allow_test_max_steps="0", effective_max_steps=55
+            )
+        for invalid in ("", "0", "-1", "+1", "1.0", " 1"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    resolve_test_stop_after_step(
+                        invalid,
+                        allow_test_max_steps="1",
+                        effective_max_steps=55,
+                    )
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            resolve_test_stop_after_step(
+                "56", allow_test_max_steps="1", effective_max_steps=55
+            )
+        self.assertEqual(
+            resolve_test_stop_after_step(
+                "51", allow_test_max_steps="1", effective_max_steps=55
+            ),
+            51,
+        )
+
+    def test_test_stop_fires_at_exact_completed_optimizer_step(self):
+        arguments = {
+            "stop_request_file": None,
+            "slurm_end_time": 0,
+            "slurm_time_limit_buffer_s": 100,
+            "test_stop_after_step": 51,
+        }
+        self.assertIsNone(partial_stop_reason(current_step=50, **arguments))
+        expected = "deterministic test stop after completed step 51"
+        self.assertEqual(
+            partial_stop_reason(current_step=51, **arguments), expected
+        )
+        self.assertEqual(
+            partial_stop_reason(current_step=52, **arguments), expected
         )
 
     def test_terminal_validation_runs_after_resume_at_max_but_not_twice(self):
@@ -144,15 +194,32 @@ class TrainingControlTest(unittest.TestCase):
         stop_boundary = source.index("stop_reason = partial_stop_reason(", loop)
         periodic_validation = source.index("# Periodic validation", stop_boundary)
         forced_save = source.index("checkpoint.save(", periodic_validation)
+        completion_state = source.index("training_completed = (", forced_save)
         terminal_validation = source.index("if should_run_terminal_validation(")
         fixed_test = source.index("if training_completed and test_dataloader is not None:")
         checkpoint_close = source.index("checkpoint.close()", fixed_test)
         completion = source.index("publish_training_done(", checkpoint_close)
         self.assertLess(stop_boundary, periodic_validation)
+        self.assertIn(
+            "test_stop_after_step=test_stop_after_step",
+            source[stop_boundary:periodic_validation],
+        )
+        self.assertIn(
+            "current_step=train_state.step",
+            source[stop_boundary:periodic_validation],
+        )
+        self.assertIn(
+            "if stop_reason is not None:\n                time_limit_triggered = True",
+            source[stop_boundary:periodic_validation],
+        )
         self.assertLess(periodic_validation, forced_save)
         self.assertIn(
             "or time_limit_triggered",
             source[forced_save : source.index("\n            )", forced_save)],
+        )
+        self.assertIn(
+            "not time_limit_triggered",
+            source[completion_state:terminal_validation],
         )
         self.assertLess(terminal_validation, fixed_test)
         self.assertLess(fixed_test, checkpoint_close)

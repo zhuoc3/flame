@@ -57,6 +57,7 @@ from flame.tools.utils import get_nparams_and_flops
 from flame.training_control import (
     partial_stop_reason,
     publish_training_done,
+    resolve_test_stop_after_step,
     should_run_terminal_validation,
 )
 from torchtitan.components.checkpoint import CheckpointManager
@@ -1192,6 +1193,16 @@ def main(job_config: JobConfig):
             os.environ.get("FLAME_MAX_STEPS_OVERRIDE", job_config.training.steps)
         )
         _effective_max_steps = min(_flame_max_steps_override, job_config.training.steps)
+        test_stop_after_step = resolve_test_stop_after_step(
+            os.environ.get("FLAME_TEST_STOP_AFTER_STEP"),
+            allow_test_max_steps=os.environ.get("QWEN38_ALLOW_TEST_MAX_STEPS"),
+            effective_max_steps=_effective_max_steps,
+        )
+        if test_stop_after_step is not None:
+            logger.warning(
+                "Deterministic lifecycle test will stop after completed optimizer "
+                f"step {test_stop_after_step:,}"
+            )
         if _effective_max_steps < job_config.training.steps:
             logger.info(
                 f"{color.yellow}FLAME_MAX_STEPS_OVERRIDE active: loop will halt at "
@@ -1397,6 +1408,8 @@ def main(job_config: JobConfig):
                 stop_request_file=stop_request_file,
                 slurm_end_time=slurm_end_time,
                 slurm_time_limit_buffer_s=slurm_time_limit_buffer_s,
+                test_stop_after_step=test_stop_after_step,
+                current_step=train_state.step,
             )
             if stop_reason is not None:
                 time_limit_triggered = True
@@ -1418,6 +1431,8 @@ def main(job_config: JobConfig):
                     stop_request_file=stop_request_file,
                     slurm_end_time=slurm_end_time,
                     slurm_time_limit_buffer_s=slurm_time_limit_buffer_s,
+                    test_stop_after_step=test_stop_after_step,
+                    current_step=train_state.step,
                 )
                 if stop_reason is not None:
                     time_limit_triggered = True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import tempfile
 import time
@@ -13,11 +14,40 @@ from pathlib import Path
 TRAINING_DONE_FORMAT_VERSION = 1
 
 
+def resolve_test_stop_after_step(
+    raw_value: str | None,
+    *,
+    allow_test_max_steps: str | None,
+    effective_max_steps: int,
+) -> int | None:
+    """Validate the deterministic partial-stop hook used by lifecycle tests."""
+
+    if raw_value is None:
+        return None
+    if allow_test_max_steps != "1":
+        raise RuntimeError(
+            "FLAME_TEST_STOP_AFTER_STEP is only allowed when "
+            "QWEN38_ALLOW_TEST_MAX_STEPS=1"
+        )
+    if re.fullmatch(r"[0-9]+", raw_value) is None:
+        raise ValueError("FLAME_TEST_STOP_AFTER_STEP must be a positive integer")
+    stop_after_step = int(raw_value)
+    if stop_after_step <= 0:
+        raise ValueError("FLAME_TEST_STOP_AFTER_STEP must be a positive integer")
+    if stop_after_step > effective_max_steps:
+        raise ValueError(
+            "FLAME_TEST_STOP_AFTER_STEP cannot exceed the effective maximum step"
+        )
+    return stop_after_step
+
+
 def partial_stop_reason(
     *,
     stop_request_file: str | None,
     slurm_end_time: int,
     slurm_time_limit_buffer_s: int,
+    test_stop_after_step: int | None = None,
+    current_step: int | None = None,
     now: float | None = None,
 ) -> str | None:
     """Return why training should checkpoint and stop at the current boundary."""
@@ -38,6 +68,12 @@ def partial_stop_reason(
                     f"{stop_request_file}"
                 )
             return f"stop request file present: {stop_request_file}"
+
+    if test_stop_after_step is not None:
+        if current_step is None:
+            raise ValueError("current_step is required for a deterministic test stop")
+        if current_step >= test_stop_after_step:
+            return f"deterministic test stop after completed step {test_stop_after_step}"
 
     current_time = time.time() if now is None else now
     if (
