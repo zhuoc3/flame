@@ -1424,6 +1424,12 @@ def main(job_config: JobConfig):
     if training_completed and test_dataloader is not None:
         run_fixed_test(train_state.step)
 
+    # Flush external metrics before publishing completion. If W&B is required
+    # and its final sync fails, the job must fail with no TRAINING_DONE marker;
+    # otherwise later chunks would skip a run whose dashboard is incomplete.
+    metric_logger.close()
+    torch.distributed.barrier()
+
     # Training-done marker + chain-mate scancel. Mirrors the synthetic trainer's
     # behavior: when the loop runs to completion (not broken out of for a
     # time-limit save), rank 0 persists a TRAINING_DONE marker in the dump
@@ -1434,11 +1440,11 @@ def main(job_config: JobConfig):
         training_completed
         and torch.distributed.get_rank() == 0
     ):
+        done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
+        with open(done_path, "w") as f:
+            f.write(f"completed {train_state.step} steps at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        logger.info(f"wrote TRAINING_DONE marker at {done_path}")
         try:
-            done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
-            with open(done_path, "w") as f:
-                f.write(f"completed {train_state.step} steps at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
-            logger.info(f"wrote TRAINING_DONE marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
             disable_chain_scancel = os.environ.get(
@@ -1457,13 +1463,12 @@ def main(job_config: JobConfig):
                     check=False, timeout=30,
                 )
         except Exception as e:
-            logger.warning(f"training-done cleanup failed: {e}")
+            logger.warning(f"pending-chain cleanup failed: {e}")
 
     if torch.distributed.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")
         time.sleep(2)
 
-    metric_logger.close()
     logger.info("Training completed")
 
 
