@@ -121,6 +121,7 @@ class TopologyIndependentDataTest(unittest.TestCase):
     def test_architecture_matrix_uses_same_32_parents_each_step(self):
         # (sequence length, DP world size, local batch, accumulation)
         matrix = (
+            (256, 2, 128, 8),
             (256, 2, 32, 32),
             (512, 4, 16, 16),
             (1_024, 4, 16, 8),
@@ -167,9 +168,9 @@ class TopologyIndependentDataTest(unittest.TestCase):
                     list(range(PARENT_SEQ_LEN // seq_len)),
                 )
 
-    def test_256_microbatches_interleave_all_32_parents(self):
+    def test_qwen_256_dp2_batch128_ga8_interleaves_all_32_parents(self):
         dataset = self._virtual_dataset(256)
-        world_size, batch_size, accumulation = 2, 32, 32
+        world_size, batch_size, accumulation = 2, 128, 8
         rank_indices = [
             _rank_step_indices(
                 rank=rank,
@@ -196,7 +197,7 @@ class TopologyIndependentDataTest(unittest.TestCase):
             self.assertEqual(len(set(parent_ids)), PARENTS_PER_STEP)
             self.assertEqual(
                 sorted(parent_ids.count(parent) for parent in set(parent_ids)),
-                [2] * PARENTS_PER_STEP,
+                [8] * PARENTS_PER_STEP,
             )
 
     def test_16k_reshaping_dp8_dp16_dp32_has_identical_step(self):
