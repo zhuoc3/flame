@@ -150,6 +150,40 @@ class TrainingControlTest(unittest.TestCase):
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(Path(temp_dir).glob(".TRAINING_DONE.*")), [])
 
+    def test_training_done_can_use_an_explicit_private_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            private = Path(temp_dir) / ".TRAINING_DONE.pending-audit"
+            payload = publish_training_done(
+                temp_dir,
+                step=55,
+                effective_max_steps=55,
+                final_validation_step=55,
+                fixed_test_completed=False,
+                marker_name=private.name,
+                completed_at_unix=1234.5,
+            )
+
+            self.assertEqual(json.loads(private.read_text(encoding="utf-8")), payload)
+            self.assertFalse((Path(temp_dir) / "TRAINING_DONE").exists())
+            self.assertEqual(private.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                list(Path(temp_dir).glob("..TRAINING_DONE.pending-audit.*")), []
+            )
+
+    def test_training_done_rejects_unsafe_marker_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for marker_name in ("", ".", "..", "../TRAINING_DONE", "a/b", "bad name"):
+                with self.subTest(marker_name=marker_name):
+                    with self.assertRaisesRegex(ValueError, "safe basename"):
+                        publish_training_done(
+                            temp_dir,
+                            step=55,
+                            effective_max_steps=55,
+                            final_validation_step=55,
+                            fixed_test_completed=False,
+                            marker_name=marker_name,
+                        )
+
     def test_training_done_failure_never_replaces_existing_marker(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             marker = Path(temp_dir) / "TRAINING_DONE"
@@ -202,6 +236,15 @@ class TrainingControlTest(unittest.TestCase):
         fixed_test = source.index("if training_completed and test_dataloader is not None:")
         checkpoint_close = source.index("checkpoint.close()", fixed_test)
         completion = source.index("publish_training_done(", checkpoint_close)
+        checkpoint_load = source.index("checkpoint_loaded = checkpoint.load(")
+        restored_rng = source.index("restored_random_state = (", checkpoint_load)
+        loaded_proof = source.index(
+            "checkpoint.save_loaded_test_checkpoint_proof(", restored_rng
+        )
+        finite_check = source.index(
+            "if qwen38_runtime_metadata is not None and checkpoint_loaded:",
+            loaded_proof,
+        )
         self.assertLess(stop_boundary, periodic_validation)
         self.assertIn(
             "test_stop_after_step=test_stop_after_step",
@@ -234,6 +277,9 @@ class TrainingControlTest(unittest.TestCase):
         self.assertLess(terminal_validation, fixed_test)
         self.assertLess(fixed_test, checkpoint_close)
         self.assertLess(checkpoint_close, completion)
+        self.assertLess(checkpoint_load, restored_rng)
+        self.assertLess(restored_rng, loaded_proof)
+        self.assertLess(loaded_proof, finite_check)
 
 
 if __name__ == "__main__":

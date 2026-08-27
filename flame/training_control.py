@@ -107,6 +107,7 @@ def publish_training_done(
     effective_max_steps: int,
     final_validation_step: int | None,
     fixed_test_completed: bool,
+    marker_name: str = "TRAINING_DONE",
     completed_at_unix: float | None = None,
 ) -> dict[str, object]:
     """Atomically publish a structured marker after durable terminal work."""
@@ -123,7 +124,14 @@ def publish_training_done(
     root = Path(dump_folder)
     if not root.is_dir():
         raise FileNotFoundError(f"training dump folder does not exist: {root}")
-    marker = root / "TRAINING_DONE"
+    if (
+        not marker_name
+        or marker_name in {".", ".."}
+        or Path(marker_name).name != marker_name
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", marker_name) is None
+    ):
+        raise ValueError("completion marker name must be a safe basename")
+    marker = root / marker_name
     payload: dict[str, object] = {
         "format_version": TRAINING_DONE_FORMAT_VERSION,
         "status": "complete",
@@ -136,7 +144,9 @@ def publish_training_done(
         ),
     }
 
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".TRAINING_DONE.", dir=root)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{marker_name}.", dir=root
+    )
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)

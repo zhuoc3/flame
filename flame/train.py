@@ -924,6 +924,12 @@ def main(job_config: JobConfig):
         if checkpoint_loaded and RANDOM_STATE_KEY in checkpoint.states
         else None
     )
+    # Lifecycle validation re-exports the just-loaded production state before
+    # model checks, dataloader reconstruction, or the first resumed step. The
+    # resulting proof must exactly match the same-state oracle written before
+    # the original checkpoint save.
+    if checkpoint_loaded:
+        checkpoint.save_loaded_test_checkpoint_proof(resolved_load_step)
     if qwen38_runtime_metadata is not None and checkpoint_loaded:
         from flame.models.qwen38 import assert_qwen38_model_finite
 
@@ -1566,15 +1572,21 @@ def main(job_config: JobConfig):
         and torch.distributed.get_rank() == 0
     ):
         try:
-            done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
+            done_marker_name = os.environ.get(
+                "FLAME_TRAINING_DONE_MARKER", "TRAINING_DONE"
+            )
+            done_path = os.path.join(
+                job_config.job.dump_folder, done_marker_name
+            )
             publish_training_done(
                 job_config.job.dump_folder,
                 step=train_state.step,
                 effective_max_steps=_effective_max_steps,
                 final_validation_step=last_validated_step,
                 fixed_test_completed=fixed_test_completed,
+                marker_name=done_marker_name,
             )
-            logger.info(f"wrote TRAINING_DONE marker at {done_path}")
+            logger.info(f"wrote training completion marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
             disable_chain_scancel = os.environ.get(
