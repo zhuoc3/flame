@@ -852,11 +852,19 @@ def main(job_config: JobConfig):
     )
 
     # Log model configuration to WandB
-    metric_logger.log_config({
+    logged_model_config = {
         "model/num_parameters": model_param_count,
         "model/num_flops_per_token": num_flops_per_token,
         "model/config": model_config.to_json_string() if hasattr(model_config, 'to_json_string') else str(model_config),
-    })
+    }
+    continuation_start_step = os.getenv(
+        "FLAME_PERFORMANCE_CONTINUATION_START_STEP"
+    )
+    if continuation_start_step is not None:
+        logged_model_config["performance/continuation_start_step"] = int(
+            continuation_start_step
+        )
+    metric_logger.log_config(logged_model_config)
 
     # plot losses loaded from checkpoint (if any) to TensorBoard
     # NOTE: Loss info after the last log step before checkpoint saving will not be ploted.
@@ -1209,6 +1217,11 @@ def main(job_config: JobConfig):
             if job_config.training.skip_nan_inf and (
                 grad_norm.isnan() or grad_norm.isinf()
             ):
+                if os.getenv("FLAME_FAIL_ON_INVALID_GRAD") == "1":
+                    raise FloatingPointError(
+                        "FLAME_FAIL_ON_INVALID_GRAD=1 and the gradient norm is "
+                        f"non-finite: {grad_norm:.4f}"
+                    )
                 logger.warning(
                     f"Skipping optimizer step - detected invalid gradient norm: {grad_norm:.4f}"
                 )
