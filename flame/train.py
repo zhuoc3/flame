@@ -47,6 +47,7 @@ from flame.data import (
     build_dataloader,
     shuffle,
 )
+from flame.gradient_accumulation import controls_gradient_sync
 from flame.models.parallelize_fla import apply_singleton_fsdp, parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
@@ -1221,9 +1222,11 @@ def main(job_config: JobConfig):
             ga_steps = job_config.training.gradient_accumulation_steps
             # do gradient accumulation if enabled
             for ga_step in range(ga_steps):
-                # Skip redundant DDP all-reduce on non-final micro-batches.
-                # The final micro-batch syncs the accumulated gradients.
-                if parallel_dims.dp_replicate_enabled and ga_steps > 1:
+                # Skip redundant DDP/FSDP gradient synchronization on
+                # non-final micro-batches. The final micro-batch syncs the
+                # accumulated gradients. Pure FSDP has dp_replicate=1, so it
+                # must key off dp_shard_enabled as well.
+                if controls_gradient_sync(parallel_dims, ga_steps):
                     model.set_requires_gradient_sync(ga_step == ga_steps - 1)
 
                 # get batch
