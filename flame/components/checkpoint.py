@@ -157,11 +157,26 @@ class FixedValidationPlanState(Stateful):
         payload.seek(0)
         loaded = json.loads(payload.read().decode("utf-8"))
         self.loaded = loaded
-        if loaded != self.current:
-            raise ValueError(
-                "Fixed validation plan changed across resume: "
-                f"saved={loaded}, current={self.current}"
-            )
+        if loaded == self.current:
+            return
+
+        # The manifest contains non-semantic provenance such as ``created_at``
+        # and the source-manifest byte hash.  Re-materializing the same fixed
+        # token array can therefore change only its manifest byte hash.  The
+        # payload hash and dimensions fully identify the ordered validation
+        # sequences, so accept that one metadata-only difference while still
+        # rejecting every change to the validation data or plan.
+        keys_match = set(loaded) == set(self.current)
+        changed = {
+            key for key in loaded if loaded.get(key) != self.current.get(key)
+        }
+        if keys_match and changed == {"manifest_sha256"}:
+            return
+
+        raise ValueError(
+            "Fixed validation plan changed across resume: "
+            f"saved={loaded}, current={self.current}"
+        )
 
 
 class FixedTestPlanState(Stateful):

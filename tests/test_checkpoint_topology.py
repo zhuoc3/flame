@@ -60,7 +60,14 @@ class CheckpointTopologyTest(unittest.TestCase):
                     {FIXED_VALIDATION_STATE_KEY: matching},
                     checkpoint_id=checkpoint_id,
                 )
-                changed = dict(plan, manifest_sha256="manifest-b")
+                metadata_only_change = FixedValidationPlanState(
+                    dict(plan, manifest_sha256="manifest-b")
+                )
+                dcp.load(
+                    {FIXED_VALIDATION_STATE_KEY: metadata_only_change},
+                    checkpoint_id=checkpoint_id,
+                )
+                changed = dict(plan, tokens_payload_sha256="payload-b")
                 with self.assertRaisesRegex(ValueError, "changed across resume"):
                     dcp.load(
                         {
@@ -72,6 +79,7 @@ class CheckpointTopologyTest(unittest.TestCase):
                     )
 
         self.assertEqual(matching.loaded, plan)
+        self.assertEqual(metadata_only_change.loaded["manifest_sha256"], "manifest-a")
 
     def test_fixed_test_plan_roundtrip_and_mismatch(self) -> None:
         plan = {
