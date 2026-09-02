@@ -25,7 +25,12 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.multiprocessing.errors import record
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
-from fla.ops.common.utils import prepare_position_ids
+try:
+    from fla.ops.common.utils import prepare_position_ids
+except ModuleNotFoundError as error:
+    if error.name not in {"fla.ops.common", "fla.ops.common.utils"}:
+        raise
+    from fla.ops.utils import prepare_position_ids
 from flame.components.checkpoint import (
     FIXED_TEST_STATE_KEY,
     FIXED_VALIDATION_STATE_KEY,
@@ -623,13 +628,16 @@ def main(job_config: JobConfig):
 
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
+    is_qwen38 = model_config.model_type == "qwen3_5_text"
+    if is_qwen38:
+        model_config._attn_implementation = "sdpa"
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. disable fused norm if TP is enabled
     # 3. vocab size from tokenizer
     # 4. context_len base on inputs
     if parallel_dims.tp_enabled:
-        if model_config.fuse_norm:
+        if getattr(model_config, "fuse_norm", False):
             logger.warning(
                 f"{color.red}"
                 f"Fused norm is not compatible with tensor parallelism. "
@@ -638,7 +646,7 @@ def main(job_config: JobConfig):
             )
             model_config.fuse_norm = False
     if parallel_dims.loss_parallel_enabled:
-        if model_config.fuse_cross_entropy:
+        if getattr(model_config, "fuse_cross_entropy", False):
             logger.warning(
                 f"{color.red}"
                 f"Loss parallel enabled. Disabling fused cross entropy for now."
@@ -651,7 +659,12 @@ def main(job_config: JobConfig):
         f"Building model from the config\n{color.green}{model_config}{color.reset}"
     )
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(model_config)
+        model_kwargs = {"attn_implementation": "sdpa"} if is_qwen38 else {}
+        model = AutoModelForCausalLM.from_config(model_config, **model_kwargs)
+        if is_qwen38 and model.config._attn_implementation != "sdpa":
+            raise RuntimeError(
+                "Qwen3.8 must use the audited SDPA full-attention implementation"
+            )
         if (
             getattr(model_config, "fuse_cross_entropy", False)
             and FusedLinearCrossEntropyLoss is not None
@@ -659,6 +672,19 @@ def main(job_config: JobConfig):
             model.criterion = FusedLinearCrossEntropyLoss(
                 num_chunks=8 // parallel_dims.tp
             )
+        if is_qwen38:
+            if job_config.training.varlen:
+                raise NotImplementedError(
+                    "Qwen3.8 packed/varlen training is not supported because its "
+                    "full-attention layers require a verified cross-document mask"
+                )
+            from scripts.qwen38_runtime import prepare_qwen38_model_for_training
+
+            qwen38_runtime = prepare_qwen38_model_for_training(
+                model,
+                loss_num_chunks=8 // parallel_dims.tp,
+            )
+            logger.info(f"Installed Qwen3.8 training runtime: {qwen38_runtime}")
         # defer weight initialization until after parallelisms are applied
         model.apply(lambda m: setattr(m, "_is_hf_initialized", False))
     logger.info(f"{color.blue}\n{model}{color.reset}\n")
@@ -719,6 +745,16 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+            if is_qwen38:
+                from scripts.qwen38_runtime import audit_qwen38_deltanet_parameters
+
+                qwen38_init_audit = audit_qwen38_deltanet_parameters(
+                    model,
+                    require_initial_values=True,
+                )
+                logger.info(
+                    f"Validated Qwen3.8 post-FSDP initialization: {qwen38_init_audit}"
+                )
         if job_config.training.force_singleton_fsdp:
             apply_singleton_fsdp(model, world_mesh, job_config)
             logger.info(
@@ -898,6 +934,19 @@ def main(job_config: JobConfig):
                 )
 
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    if is_qwen38:
+        from scripts.qwen38_runtime import audit_qwen38_deltanet_parameters
+
+        qwen38_loaded_audit = audit_qwen38_deltanet_parameters(
+            model,
+            require_initial_values=(
+                not checkpoint_loaded or resolved_load_step == 0
+            ),
+        )
+        logger.info(
+            "Validated Qwen3.8 parameters after checkpoint resolution: "
+            f"{qwen38_loaded_audit}"
+        )
     # A legacy load temporarily omitted this missing key. All subsequent
     # checkpoints record the current topology.
     if checkpoint.enable_checkpoint:
@@ -1025,16 +1074,22 @@ def main(job_config: JobConfig):
                     batch = next(current_val_iterator)
                 input_ids = batch["input_ids"].to(device_type)
                 labels = batch["labels"].to(device_type)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device_type)
                 position_ids = (
                     torch.arange(0, input_ids.shape[1], device=device_type)
                     .repeat(input_ids.shape[0], 1)
                     .to(torch.int32)
                 )
-                output = model_parts[0](
+                model_kwargs = dict(
                     input_ids=input_ids,
                     labels=labels,
                     position_ids=position_ids,
                 )
+                if attention_mask is not None:
+                    model_kwargs["attention_mask"] = attention_mask
+                output = model_parts[0](**model_kwargs)
                 val_losses.append(output.loss.detach())
                 if (
                     fixed_validation
@@ -1121,16 +1176,22 @@ def main(job_config: JobConfig):
                     ) from error
                 input_ids = batch["input_ids"].to(device_type)
                 labels = batch["labels"].to(device_type)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device_type)
                 position_ids = (
                     torch.arange(0, input_ids.shape[1], device=device_type)
                     .repeat(input_ids.shape[0], 1)
                     .to(torch.int32)
                 )
-                output = model_parts[0](
+                model_kwargs = dict(
                     input_ids=input_ids,
                     labels=labels,
                     position_ids=position_ids,
                 )
+                if attention_mask is not None:
+                    model_kwargs["attention_mask"] = attention_mask
+                output = model_parts[0](**model_kwargs)
                 test_losses.append(output.loss.detach())
                 if fixed_test_dataset.valid_lengths_path is not None:
                     test_loss_weights.append(
@@ -1233,6 +1294,7 @@ def main(job_config: JobConfig):
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
                 input_ids, labels = batch["input_ids"], batch["labels"]
+                attention_mask = batch.get("attention_mask")
 
                 # Update metrics processor state before forward/backward
                 metric_logger.ntokens_since_last_log += labels.numel()
@@ -1241,6 +1303,8 @@ def main(job_config: JobConfig):
                 )
 
                 input_ids = input_ids.to(device_type)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device_type)
 
                 """
                 TODO[flame]: We need to carefully handle the position_ids for TP/CP
@@ -1308,12 +1372,16 @@ def main(job_config: JobConfig):
                 else:
                     # Non-PP forward / backward
                     with train_context(optional_context_parallel_ctx):
-                        output = model(
+                        model_kwargs = dict(
                             input_ids=input_ids,
                             labels=labels,
                             position_ids=position_ids,
-                            cu_seqlens=cu_seqlens,
                         )
+                        if attention_mask is not None:
+                            model_kwargs["attention_mask"] = attention_mask
+                        if cu_seqlens is not None:
+                            model_kwargs["cu_seqlens"] = cu_seqlens
+                        output = model(**model_kwargs)
                         loss = (
                             output.loss
                             / job_config.training.gradient_accumulation_steps
@@ -1521,8 +1589,17 @@ def main(job_config: JobConfig):
     ):
         try:
             done_path = os.path.join(job_config.job.dump_folder, "TRAINING_DONE")
-            with open(done_path, "w") as f:
+            temporary_done_path = f"{done_path}.tmp-{os.getpid()}"
+            with open(temporary_done_path, "x") as f:
                 f.write(f"completed {train_state.step} steps at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_done_path, done_path)
+            directory_fd = os.open(job_config.job.dump_folder, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             logger.info(f"wrote TRAINING_DONE marker at {done_path}")
             job_name = os.environ.get("SLURM_JOB_NAME")
             user = os.environ.get("USER") or os.environ.get("LOGNAME")
