@@ -258,6 +258,16 @@ class JobConfig:
             "--training.seq_len", type=int, default=2048, help="Sequence length"
         )
         self.parser.add_argument(
+            "--training.loss_start_position",
+            type=int,
+            default=0,
+            help=(
+                "Zero-indexed token position at which causal language-model loss "
+                "starts. Labels for earlier token positions are set to -100; "
+                "position 0 retains the existing full-sequence objective."
+            ),
+        )
+        self.parser.add_argument(
             "--training.context_len",
             type=int,
             default=2048,
@@ -952,6 +962,13 @@ class JobConfig:
         # TODO: Add more mandatory validations
         assert self.model.config
         assert self.model.tokenizer_path
+        if self.training.loss_start_position < 0:
+            raise ValueError("training.loss_start_position must be non-negative")
+        if self.training.loss_start_position >= self.training.seq_len:
+            raise ValueError(
+                "training.loss_start_position must be smaller than training.seq_len "
+                "so every sequence retains at least one loss target"
+            )
 
     def _get_string_list_argument_names(self) -> list[str]:
         """Get the parser argument names of type `string_list`."""

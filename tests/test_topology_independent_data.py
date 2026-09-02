@@ -515,6 +515,67 @@ class TopologyIndependentDataTest(unittest.TestCase):
             ):
                 MemmapTokenBlockDataset(root, verify_payload=True)
 
+    def test_loss_start_position_preserves_boundary_and_tail_mask(self):
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=_IdentityTokenizer(),
+            context_len=8,
+            varlen=False,
+            loss_start_position=4,
+        )
+        batch = collator(
+            [
+                {
+                    "input_ids": torch.arange(8),
+                    "attention_mask": torch.tensor([1, 1, 1, 1, 1, 1, 0, 0]),
+                },
+                {
+                    "input_ids": torch.arange(10, 18),
+                    "attention_mask": torch.ones(8, dtype=torch.long),
+                },
+            ]
+        )
+
+        torch.testing.assert_close(
+            batch["labels"],
+            torch.tensor(
+                [
+                    [-100, -100, -100, -100, 4, 5, -100, -100],
+                    [-100, -100, -100, -100, 14, 15, 16, 17],
+                ]
+            ),
+        )
+        # Models shift labels internally. The first retained target is token
+        # position 4, paired with the logits produced at position 3.
+        torch.testing.assert_close(
+            batch["labels"][..., 1:],
+            torch.tensor(
+                [
+                    [-100, -100, -100, 4, 5, -100, -100],
+                    [-100, -100, -100, 14, 15, 16, 17],
+                ]
+            ),
+        )
+
+    def test_loss_start_position_masks_varlen_labels(self):
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=_IdentityTokenizer(),
+            context_len=8,
+            varlen=True,
+            loss_start_position=3,
+        )
+        batch = collator([{"input_ids": torch.arange(8), "cu_seqlens": [0, 8]}])
+        torch.testing.assert_close(
+            batch["labels"],
+            torch.tensor([[-100, -100, -100, 3, 4, 5, 6, 7]]),
+        )
+
+    def test_loss_start_position_rejects_negative_value(self):
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=_IdentityTokenizer(), loss_start_position=-1
+        )
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            collator([torch.arange(8)])
+
     def test_masked_parent_rejects_shorter_child_views(self):
         class _Parents(Dataset):
             valid_lengths_path = Path("valid_lengths.npy")
