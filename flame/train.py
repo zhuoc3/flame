@@ -459,6 +459,14 @@ def main(job_config: JobConfig):
                 f"length: store={fixed_val_dataset.seq_len}, "
                 f"training={job_config.training.seq_len}"
             )
+        if (
+            fixed_val_dataset.valid_lengths_path is not None
+            and job_config.training.varlen
+        ):
+            raise ValueError(
+                "Fixed validation with valid_lengths requires "
+                "--training.varlen=False so padded labels remain excluded from loss"
+            )
         fixed_val_sampler = FixedValidationSampler(
             rank=dp_rank,
             world_size=dp_degree,
@@ -478,19 +486,27 @@ def main(job_config: JobConfig):
         )
         fixed_validation = True
         val_batches_per_rank = len(val_dataloader)
-        fixed_validation_tokens = (
-            len(fixed_val_dataset) * fixed_val_dataset.seq_len
-        )
+        fixed_validation_tokens = fixed_val_dataset.num_valid_tokens
+        fixed_validation_plan = {
+            "schema_version": 1,
+            "manifest_sha256": fixed_val_dataset.manifest_sha256,
+            "tokens_payload_sha256": fixed_val_dataset.manifest.get(
+                "tokens_payload_sha256"
+            ),
+            "num_sequences": len(fixed_val_dataset),
+            "seq_len": fixed_val_dataset.seq_len,
+        }
+        if fixed_val_dataset.valid_lengths_path is not None:
+            fixed_validation_plan.update(
+                {
+                    "valid_lengths_payload_sha256": fixed_val_dataset.manifest.get(
+                        "valid_lengths_payload_sha256"
+                    ),
+                    "num_valid_tokens": fixed_val_dataset.num_valid_tokens,
+                }
+            )
         fixed_validation_plan_state = FixedValidationPlanState(
-            {
-                "schema_version": 1,
-                "manifest_sha256": fixed_val_dataset.manifest_sha256,
-                "tokens_payload_sha256": fixed_val_dataset.manifest.get(
-                    "tokens_payload_sha256"
-                ),
-                "num_sequences": len(fixed_val_dataset),
-                "seq_len": fixed_val_dataset.seq_len,
-            }
+            fixed_validation_plan
         )
         logger.info(
             "Fixed validation enabled: "
@@ -550,6 +566,14 @@ def main(job_config: JobConfig):
                 f"store={fixed_test_dataset.seq_len}, "
                 f"training={job_config.training.seq_len}"
             )
+        if (
+            fixed_test_dataset.valid_lengths_path is not None
+            and job_config.training.varlen
+        ):
+            raise ValueError(
+                "Fixed test with valid_lengths requires --training.varlen=False "
+                "so padded labels remain excluded from loss"
+            )
         fixed_test_sampler = FixedValidationSampler(
             rank=dp_rank,
             world_size=dp_degree,
@@ -568,18 +592,26 @@ def main(job_config: JobConfig):
             num_workers=0,
         )
         test_batches_per_rank = len(test_dataloader)
-        fixed_test_tokens = len(fixed_test_dataset) * fixed_test_dataset.seq_len
-        fixed_test_plan_state = FixedTestPlanState(
-            {
-                "schema_version": 1,
-                "manifest_sha256": fixed_test_dataset.manifest_sha256,
-                "tokens_payload_sha256": fixed_test_dataset.manifest.get(
-                    "tokens_payload_sha256"
-                ),
-                "num_sequences": len(fixed_test_dataset),
-                "seq_len": fixed_test_dataset.seq_len,
-            }
-        )
+        fixed_test_tokens = fixed_test_dataset.num_valid_tokens
+        fixed_test_plan = {
+            "schema_version": 1,
+            "manifest_sha256": fixed_test_dataset.manifest_sha256,
+            "tokens_payload_sha256": fixed_test_dataset.manifest.get(
+                "tokens_payload_sha256"
+            ),
+            "num_sequences": len(fixed_test_dataset),
+            "seq_len": fixed_test_dataset.seq_len,
+        }
+        if fixed_test_dataset.valid_lengths_path is not None:
+            fixed_test_plan.update(
+                {
+                    "valid_lengths_payload_sha256": fixed_test_dataset.manifest.get(
+                        "valid_lengths_payload_sha256"
+                    ),
+                    "num_valid_tokens": fixed_test_dataset.num_valid_tokens,
+                }
+            )
+        fixed_test_plan_state = FixedTestPlanState(fixed_test_plan)
         logger.info(
             "Fixed test enabled: run once after training, "
             f"global_sequences={len(fixed_test_dataset):,}, "
@@ -968,6 +1000,7 @@ def main(job_config: JobConfig):
         if val_dataloader is None:
             return
         val_losses = []
+        val_loss_weights = []
         val_tokens = 0
         for m in model_parts:
             m.eval()
@@ -1002,6 +1035,13 @@ def main(job_config: JobConfig):
                     position_ids=position_ids,
                 )
                 val_losses.append(output.loss.detach())
+                if (
+                    fixed_validation
+                    and fixed_val_dataset.valid_lengths_path is not None
+                ):
+                    val_loss_weights.append(
+                        labels[..., 1:].ne(-100).sum().to(output.loss.dtype)
+                    )
                 val_tokens += labels.numel()
         for m in model_parts:
             m.train()
@@ -1020,13 +1060,31 @@ def main(job_config: JobConfig):
                 if hasattr(sub, "reshard") and callable(getattr(sub, "reshard")):
                     sub.reshard()
 
-        avg_val_loss = torch.stack(val_losses).mean()
-        if (
+        distributed_evaluation = (
             parallel_dims.dp_replicate_enabled
             or parallel_dims.dp_shard_enabled
             or parallel_dims.cp_enabled
-        ):
-            avg_val_loss = dist_utils.dist_mean(avg_val_loss, world_mesh["dp_cp"])
+        )
+        if val_loss_weights:
+            val_loss_weight = torch.stack(val_loss_weights)
+            val_loss_sum = (
+                torch.stack(val_losses) * val_loss_weight
+            ).sum()
+            val_loss_weight = val_loss_weight.sum()
+            if distributed_evaluation:
+                val_loss_sum = dist_utils.dist_mean(
+                    val_loss_sum, world_mesh["dp_cp"]
+                )
+                val_loss_weight = dist_utils.dist_mean(
+                    val_loss_weight, world_mesh["dp_cp"]
+                )
+            avg_val_loss = val_loss_sum / val_loss_weight
+        else:
+            avg_val_loss = torch.stack(val_losses).mean()
+            if distributed_evaluation:
+                avg_val_loss = dist_utils.dist_mean(
+                    avg_val_loss, world_mesh["dp_cp"]
+                )
 
         if isinstance(avg_val_loss, torch.Tensor):
             avg_val_loss = avg_val_loss.item()
@@ -1047,6 +1105,7 @@ def main(job_config: JobConfig):
         if test_dataloader is None:
             return
         test_losses = []
+        test_loss_weights = []
         for m in model_parts:
             m.eval()
         test_iterator = iter(test_dataloader)
@@ -1072,21 +1131,41 @@ def main(job_config: JobConfig):
                     position_ids=position_ids,
                 )
                 test_losses.append(output.loss.detach())
+                if fixed_test_dataset.valid_lengths_path is not None:
+                    test_loss_weights.append(
+                        labels[..., 1:].ne(-100).sum().to(output.loss.dtype)
+                    )
         for m in model_parts:
             m.train()
             for sub in m.modules():
                 if hasattr(sub, "reshard") and callable(getattr(sub, "reshard")):
                     sub.reshard()
 
-        avg_test_loss = torch.stack(test_losses).mean()
-        if (
+        distributed_evaluation = (
             parallel_dims.dp_replicate_enabled
             or parallel_dims.dp_shard_enabled
             or parallel_dims.cp_enabled
-        ):
-            avg_test_loss = dist_utils.dist_mean(
-                avg_test_loss, world_mesh["dp_cp"]
-            )
+        )
+        if test_loss_weights:
+            test_loss_weight = torch.stack(test_loss_weights)
+            test_loss_sum = (
+                torch.stack(test_losses) * test_loss_weight
+            ).sum()
+            test_loss_weight = test_loss_weight.sum()
+            if distributed_evaluation:
+                test_loss_sum = dist_utils.dist_mean(
+                    test_loss_sum, world_mesh["dp_cp"]
+                )
+                test_loss_weight = dist_utils.dist_mean(
+                    test_loss_weight, world_mesh["dp_cp"]
+                )
+            avg_test_loss = test_loss_sum / test_loss_weight
+        else:
+            avg_test_loss = torch.stack(test_losses).mean()
+            if distributed_evaluation:
+                avg_test_loss = dist_utils.dist_mean(
+                    avg_test_loss, world_mesh["dp_cp"]
+                )
 
         if isinstance(avg_test_loss, torch.Tensor):
             avg_test_loss = avg_test_loss.item()

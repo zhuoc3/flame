@@ -348,7 +348,7 @@ class DataCollatorForLanguageModeling:
 
         def tensorize(example: Dict[str, Any]) -> Dict[str, Any]:
             tensorized = {}
-            for key in ['input_ids', 'cu_seqlens']:
+            for key in ['input_ids', 'attention_mask', 'cu_seqlens']:
                 if key not in example:
                     continue
                 if isinstance(example[key], List):
@@ -361,10 +361,29 @@ class DataCollatorForLanguageModeling:
 
         examples = list(map(tensorize, examples))
 
+        if self.varlen and any('attention_mask' in example for example in examples):
+            raise ValueError(
+                'Masked token blocks are not supported with varlen=True; '
+                'use varlen=False so padded labels remain excluded from loss'
+            )
+
         if not self.varlen:
             # --- Handling for varlen=False (Batch Padding) ---
             length_of_first = examples[0]['input_ids'].size(0)
             needs_padding = not all(example['input_ids'].size(0) == length_of_first for example in examples)
+
+            has_attention_mask = any('attention_mask' in example for example in examples)
+            if has_attention_mask:
+                for example in examples:
+                    input_ids = example['input_ids']
+                    attention_mask = example.get('attention_mask')
+                    if attention_mask is None:
+                        example['attention_mask'] = torch.ones_like(input_ids)
+                    elif attention_mask.size() != input_ids.size():
+                        raise ValueError(
+                            'An example attention_mask must have the same shape as input_ids; '
+                            f'got {tuple(attention_mask.size())} and {tuple(input_ids.size())}'
+                        )
 
             if needs_padding:
                 # Check for pad token if padding is actually required
@@ -380,8 +399,11 @@ class DataCollatorForLanguageModeling:
                 input_ids = torch.stack([example['input_ids'] for example in examples], dim=0)
                 batch = {
                     'input_ids': input_ids,
-                    # Create attention mask of all ones
-                    'attention_mask': torch.ones_like(input_ids),
+                    'attention_mask': (
+                        torch.stack([example['attention_mask'] for example in examples], dim=0)
+                        if has_attention_mask
+                        else torch.ones_like(input_ids)
+                    ),
                 }
 
             # Create labels by cloning input_ids
@@ -655,6 +677,16 @@ class MemmapTokenBlockDataset(TorchDataset):
         self.num_rows = int(self.manifest["num_rows"])
         self.tokens_path = self.root / self.manifest.get("tokens_file", "tokens.npy")
         self._tokens = None
+        self.num_valid_tokens = self.num_rows * self.seq_len
+        valid_lengths_file = self.manifest.get("valid_lengths_file")
+        default_valid_lengths_path = self.root / "valid_lengths.npy"
+        if valid_lengths_file is not None:
+            self.valid_lengths_path = self.root / valid_lengths_file
+        elif default_valid_lengths_path.is_file():
+            self.valid_lengths_path = default_valid_lengths_path
+        else:
+            self.valid_lengths_path = None
+        self._valid_lengths = None
 
         tokens = np.load(self.tokens_path, mmap_mode="r", allow_pickle=False)
         expected_shape = (self.num_rows, self.seq_len)
@@ -665,6 +697,30 @@ class MemmapTokenBlockDataset(TorchDataset):
         if tokens.dtype != np.uint16:
             raise ValueError(f"Token store must use uint16, got {tokens.dtype}")
         del tokens
+        if self.valid_lengths_path is not None:
+            if not self.valid_lengths_path.is_file():
+                raise FileNotFoundError(
+                    f"Valid-length store not found: {self.valid_lengths_path}"
+                )
+            valid_lengths = np.load(
+                self.valid_lengths_path, mmap_mode="r", allow_pickle=False
+            )
+            if valid_lengths.shape != (self.num_rows,):
+                raise ValueError(
+                    f"Valid-length store shape is {valid_lengths.shape}, expected "
+                    f"{(self.num_rows,)}"
+                )
+            if not np.issubdtype(valid_lengths.dtype, np.integer):
+                raise ValueError(
+                    f"Valid-length store must use an integer dtype, got "
+                    f"{valid_lengths.dtype}"
+                )
+            if np.any(valid_lengths < 0) or np.any(valid_lengths > self.seq_len):
+                raise ValueError(
+                    f"Valid lengths must be in [0, {self.seq_len}]"
+                )
+            self.num_valid_tokens = int(valid_lengths.sum(dtype=np.uint64))
+            del valid_lengths
         if verify_payload:
             expected_sha256 = self.manifest.get("tokens_payload_sha256")
             if not expected_sha256:
@@ -690,10 +746,43 @@ class MemmapTokenBlockDataset(TorchDataset):
                     f"Token payload SHA256 mismatch for {self.root}: "
                     f"manifest={expected_sha256}, actual={actual_sha256}"
                 )
+            if self.valid_lengths_path is not None:
+                expected_valid_lengths_sha256 = self.manifest.get(
+                    "valid_lengths_payload_sha256"
+                )
+                if not expected_valid_lengths_sha256:
+                    raise ValueError(
+                        f"Token store {self.root} has no valid-length payload "
+                        "checksum to verify"
+                    )
+                valid_lengths_digest = hashlib.sha256()
+                with self.valid_lengths_path.open("rb") as handle:
+                    version = np.lib.format.read_magic(handle)
+                    if version == (1, 0):
+                        np.lib.format.read_array_header_1_0(handle)
+                    elif version == (2, 0):
+                        np.lib.format.read_array_header_2_0(handle)
+                    else:
+                        raise ValueError(
+                            f"Unsupported NPY version {version} in "
+                            f"{self.valid_lengths_path}"
+                        )
+                    while block := handle.read(8 << 20):
+                        valid_lengths_digest.update(block)
+                actual_valid_lengths_sha256 = valid_lengths_digest.hexdigest()
+                if actual_valid_lengths_sha256 != expected_valid_lengths_sha256:
+                    raise ValueError(
+                        f"Valid-length payload SHA256 mismatch for {self.root}: "
+                        f"manifest={expected_valid_lengths_sha256}, "
+                        f"actual={actual_valid_lengths_sha256}"
+                    )
 
     @property
     def column_names(self) -> List[str]:
-        return ["input_ids"]
+        columns = ["input_ids"]
+        if self.valid_lengths_path is not None:
+            columns.append("valid_length")
+        return columns
 
     def __len__(self) -> int:
         return self.num_rows
@@ -703,12 +792,23 @@ class MemmapTokenBlockDataset(TorchDataset):
             self._tokens = np.load(self.tokens_path, mmap_mode="r", allow_pickle=False)
         return self._tokens
 
+    def _valid_lengths_array(self):
+        if self._valid_lengths is None:
+            self._valid_lengths = np.load(
+                self.valid_lengths_path, mmap_mode="r", allow_pickle=False
+            )
+        return self._valid_lengths
+
     def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
-        return {"input_ids": self._array()[index]}
+        result = {"input_ids": self._array()[index]}
+        if self.valid_lengths_path is not None:
+            result["valid_length"] = int(self._valid_lengths_array()[index])
+        return result
 
     def __getstate__(self):
         state = dict(self.__dict__)
         state["_tokens"] = None
+        state["_valid_lengths"] = None
         return state
 
 
@@ -722,10 +822,19 @@ class Int64TokenBlockDatasetView(TorchDataset):
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        tokens = np.array(
-            self.dataset[index]["input_ids"], dtype=np.int64, copy=True
-        )
-        return {"input_ids": torch.from_numpy(tokens)}
+        row = self.dataset[index]
+        tokens = np.array(row["input_ids"], dtype=np.int64, copy=True)
+        result = {"input_ids": torch.from_numpy(tokens)}
+        if "valid_length" in row:
+            valid_length = int(row["valid_length"])
+            result["attention_mask"] = torch.arange(
+                len(tokens), dtype=torch.long
+            ).lt(valid_length).to(dtype=torch.long)
+        elif "attention_mask" in row:
+            result["attention_mask"] = torch.as_tensor(
+                row["attention_mask"], dtype=torch.long
+            ).clone()
+        return result
 
 
 class DeterministicParentBlockDataset(TorchDataset):
@@ -747,6 +856,15 @@ class DeterministicParentBlockDataset(TorchDataset):
         if parent_seq_len % seq_len:
             raise ValueError(
                 f"seq_len={seq_len} must divide parent_seq_len={parent_seq_len}"
+            )
+        if (
+            getattr(parent_dataset, "valid_lengths_path", None) is not None
+            and seq_len != parent_seq_len
+        ):
+            raise ValueError(
+                "A parent-block store with valid_lengths cannot be split into "
+                "shorter children because a child may contain no valid targets; "
+                f"use seq_len={parent_seq_len}"
             )
         if parent_blocks_per_step <= 0:
             raise ValueError("parent_blocks_per_step must be positive")
@@ -786,7 +904,8 @@ class DeterministicParentBlockDataset(TorchDataset):
 
     def __getitem__(self, global_sample_index: int) -> Dict[str, torch.Tensor]:
         parent_index, child_index, _ = self.parent_and_child(global_sample_index)
-        parent = self.parent_dataset[parent_index]["input_ids"]
+        parent_row = self.parent_dataset[parent_index]
+        parent = parent_row["input_ids"]
         if len(parent) != self.parent_seq_len:
             raise ValueError(
                 f"Parent row {parent_index} has {len(parent)} tokens; expected "
@@ -794,7 +913,21 @@ class DeterministicParentBlockDataset(TorchDataset):
             )
         start = child_index * self.seq_len
         child = np.asarray(parent[start : start + self.seq_len], dtype=np.int64)
-        return {"input_ids": torch.from_numpy(child.copy())}
+        result = {"input_ids": torch.from_numpy(child.copy())}
+        if "valid_length" in parent_row:
+            child_valid_length = min(
+                self.seq_len, max(0, int(parent_row["valid_length"]) - start)
+            )
+            result["attention_mask"] = torch.arange(
+                self.seq_len, dtype=torch.long
+            ).lt(child_valid_length).to(dtype=torch.long)
+        elif "attention_mask" in parent_row:
+            parent_attention_mask = parent_row["attention_mask"]
+            result["attention_mask"] = torch.as_tensor(
+                parent_attention_mask[start : start + self.seq_len],
+                dtype=torch.long,
+            ).clone()
+        return result
 
 
 class TopologyIndependentSampler(Sampler[int]):
@@ -957,6 +1090,11 @@ def build_dataloader(
     parent_blocks_per_step: int = 32,
 ):
     if isinstance(dataset, MemmapTokenBlockDataset):
+        if dataset.valid_lengths_path is not None and varlen:
+            raise ValueError(
+                "A parent-block store with valid_lengths requires varlen=False "
+                "so padded labels remain excluded from loss"
+            )
         virtual_dataset = DeterministicParentBlockDataset(
             parent_dataset=dataset,
             seq_len=seq_len,

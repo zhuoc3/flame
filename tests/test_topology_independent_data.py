@@ -41,6 +41,20 @@ def _index_collate(indices):
     return torch.tensor(indices, dtype=torch.int64)
 
 
+def _npy_payload_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            np.lib.format.read_array_header_2_0(handle)
+        else:
+            raise AssertionError(f"Unsupported test NPY version: {version}")
+        digest.update(handle.read())
+    return digest.hexdigest()
+
+
 def _rank_step_indices(
     *,
     rank: int,
@@ -358,16 +372,10 @@ class TopologyIndependentDataTest(unittest.TestCase):
                 np.arange(32, dtype=np.uint16).reshape(4, 8),
                 allow_pickle=False,
             )
-            digest = hashlib.sha256()
-            with tokens_path.open("rb") as handle:
-                version = np.lib.format.read_magic(handle)
-                self.assertEqual(version, (1, 0))
-                np.lib.format.read_array_header_1_0(handle)
-                digest.update(handle.read())
             manifest = {
                 "seq_len": 8,
                 "num_rows": 4,
-                "tokens_payload_sha256": digest.hexdigest(),
+                "tokens_payload_sha256": _npy_payload_sha256(tokens_path),
             }
             (root / "manifest.json").write_text(json.dumps(manifest))
             MemmapTokenBlockDataset(root, verify_payload=True)
@@ -416,6 +424,153 @@ class TopologyIndependentDataTest(unittest.TestCase):
                 torch.testing.assert_close(
                     batch["labels"], batch["input_ids"], rtol=0, atol=0
                 )
+
+    def test_memmap_store_without_valid_lengths_preserves_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = np.arange(16, dtype=np.uint16).reshape(2, 8)
+            np.save(root / "tokens.npy", source, allow_pickle=False)
+            (root / "manifest.json").write_text(
+                json.dumps({"seq_len": 8, "num_rows": 2})
+            )
+
+            dataset = MemmapTokenBlockDataset(root)
+            self.assertEqual(dataset.column_names, ["input_ids"])
+            self.assertEqual(set(dataset[0]), {"input_ids"})
+            self.assertEqual(
+                set(Int64TokenBlockDatasetView(dataset)[0]), {"input_ids"}
+            )
+
+    def test_valid_lengths_mask_full_and_padded_tail_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = np.arange(16, dtype=np.uint16).reshape(2, 8)
+            np.save(root / "tokens.npy", source, allow_pickle=False)
+            np.save(
+                root / "valid_lengths.npy",
+                np.array([8, 5], dtype=np.uint32),
+                allow_pickle=False,
+            )
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "seq_len": 8,
+                        "num_rows": 2,
+                        "valid_lengths_file": "valid_lengths.npy",
+                    }
+                )
+            )
+
+            memmap_dataset = MemmapTokenBlockDataset(root)
+            self.assertEqual(
+                memmap_dataset.column_names, ["input_ids", "valid_length"]
+            )
+            self.assertEqual(memmap_dataset[0]["valid_length"], 8)
+            self.assertEqual(memmap_dataset[1]["valid_length"], 5)
+            self.assertEqual(memmap_dataset.num_valid_tokens, 13)
+
+            dataset = Int64TokenBlockDatasetView(memmap_dataset)
+            torch.testing.assert_close(
+                dataset[0]["attention_mask"], torch.ones(8, dtype=torch.long)
+            )
+            torch.testing.assert_close(
+                dataset[1]["attention_mask"],
+                torch.tensor([1, 1, 1, 1, 1, 0, 0, 0]),
+            )
+
+            batch = DataCollatorForLanguageModeling(
+                tokenizer=_IdentityTokenizer(), context_len=8, varlen=False
+            )([dataset[0], dataset[1]])
+            torch.testing.assert_close(
+                batch["attention_mask"],
+                torch.tensor(
+                    [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0, 0]]
+                ),
+            )
+            torch.testing.assert_close(
+                batch["labels"][1],
+                torch.tensor([8, 9, 10, 11, 12, -100, -100, -100]),
+            )
+
+            manifest = memmap_dataset.manifest
+            manifest["tokens_payload_sha256"] = _npy_payload_sha256(
+                root / "tokens.npy"
+            )
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(
+                ValueError, "no valid-length payload checksum"
+            ):
+                MemmapTokenBlockDataset(root, verify_payload=True)
+
+            manifest["valid_lengths_payload_sha256"] = _npy_payload_sha256(
+                root / "valid_lengths.npy"
+            )
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            MemmapTokenBlockDataset(root, verify_payload=True)
+
+            manifest["valid_lengths_payload_sha256"] = "0" * 64
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(
+                ValueError, "Valid-length payload SHA256 mismatch"
+            ):
+                MemmapTokenBlockDataset(root, verify_payload=True)
+
+    def test_masked_parent_rejects_shorter_child_views(self):
+        class _Parents(Dataset):
+            valid_lengths_path = Path("valid_lengths.npy")
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, index):
+                return {
+                    "input_ids": np.arange(8, dtype=np.uint16),
+                    "valid_length": 6,
+                }
+
+        with self.assertRaisesRegex(
+            ValueError, "cannot be split into shorter children"
+        ):
+            DeterministicParentBlockDataset(
+                parent_dataset=_Parents(),
+                seq_len=4,
+                parent_seq_len=8,
+                parent_blocks_per_step=1,
+                seed=42,
+            )
+
+        dataset = DeterministicParentBlockDataset(
+            parent_dataset=_Parents(),
+            seq_len=8,
+            parent_seq_len=8,
+            parent_blocks_per_step=1,
+            seed=42,
+        )
+        child = dataset[0]
+        torch.testing.assert_close(
+            child["attention_mask"], torch.tensor([1, 1, 1, 1, 1, 1, 0, 0])
+        )
+        torch.testing.assert_close(
+            child["input_ids"], torch.tensor([0, 1, 2, 3, 4, 5, 6, 7])
+        )
+
+    def test_varlen_collator_rejects_attention_masks(self):
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=_IdentityTokenizer(), context_len=8, varlen=True
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Masked token blocks are not supported with varlen=True"
+        ):
+            collator(
+                [
+                    {
+                        "input_ids": torch.arange(8),
+                        "attention_mask": torch.tensor(
+                            [1, 1, 1, 1, 1, 0, 0, 0]
+                        ),
+                    }
+                ]
+            )
 
     def test_sampler_rejects_non_exact_logical_batch(self):
         with self.assertRaisesRegex(ValueError, "one logical parent cohort"):
