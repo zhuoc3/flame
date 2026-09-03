@@ -53,6 +53,12 @@ from flame.data import (
     shuffle,
 )
 from flame.gradient_accumulation import controls_gradient_sync
+from flame.loss import (
+    causal_lm_loss_scales,
+    count_causal_lm_targets,
+    count_causal_lm_targets_from_valid_lengths,
+)
+from flame.model_archive import model_archive_is_due, save_model_only_archive
 from flame.models.parallelize_fla import apply_singleton_fsdp, parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
@@ -95,6 +101,28 @@ register_train_spec(
 @record
 def main(job_config: JobConfig):
     logger.info(f"Starting job: {job_config.job.description}")
+
+    try:
+        archive_every_steps = int(
+            os.environ.get("FLAME_ARCHIVE_EVERY_STEPS", "5000")
+        )
+    except ValueError as error:
+        raise ValueError("FLAME_ARCHIVE_EVERY_STEPS must be an integer") from error
+    if archive_every_steps < 0:
+        raise ValueError("FLAME_ARCHIVE_EVERY_STEPS must be non-negative")
+    if archive_every_steps > 0 and not job_config.checkpoint.enable_checkpoint:
+        raise ValueError(
+            "Model-only archives require checkpoint.enable_checkpoint so the "
+            "distributed model state is available"
+        )
+    logger.info(
+        "Model-only bf16 archive cadence: "
+        + (
+            f"every {archive_every_steps:,} steps (fail-hard)"
+            if archive_every_steps > 0
+            else "disabled"
+        )
+    )
 
     if job_config.experimental.custom_model_path:
         utils.import_module_from_path(job_config.experimental.custom_model_path)
@@ -430,6 +458,7 @@ def main(job_config: JobConfig):
         gradient_accumulation_steps=job_config.training.gradient_accumulation_steps,
         seed=job_config.training.seed,
         parent_blocks_per_step=job_config.training.parent_blocks_per_step,
+        loss_start_position=job_config.training.loss_start_position,
     )
 
     # Validation dataloader (optional). The fixed parent-block mode is
@@ -487,12 +516,22 @@ def main(job_config: JobConfig):
                 tokenizer=tokenizer,
                 context_len=job_config.training.context_len,
                 varlen=job_config.training.varlen,
+                loss_start_position=job_config.training.loss_start_position,
             ),
             num_workers=0,
         )
         fixed_validation = True
         val_batches_per_rank = len(val_dataloader)
-        fixed_validation_tokens = fixed_val_dataset.num_valid_tokens
+        if fixed_val_dataset.valid_lengths_path is not None:
+            validation_lengths = fixed_val_dataset._valid_lengths_array()
+        else:
+            validation_lengths = [fixed_val_dataset.seq_len] * len(
+                fixed_val_dataset
+            )
+        fixed_validation_tokens = count_causal_lm_targets_from_valid_lengths(
+            validation_lengths,
+            job_config.training.loss_start_position,
+        )
         fixed_validation_plan = {
             "schema_version": 1,
             "manifest_sha256": fixed_val_dataset.manifest_sha256,
@@ -509,6 +548,7 @@ def main(job_config: JobConfig):
                         "valid_lengths_payload_sha256"
                     ),
                     "num_valid_tokens": fixed_val_dataset.num_valid_tokens,
+                    "num_loss_targets": fixed_validation_tokens,
                 }
             )
         fixed_validation_plan_state = FixedValidationPlanState(
@@ -518,7 +558,7 @@ def main(job_config: JobConfig):
             "Fixed validation enabled: "
             f"every {job_config.training.val_interval} steps, "
             f"global_sequences={len(fixed_val_dataset):,}, "
-            f"global_tokens={fixed_validation_tokens:,}, "
+            f"global_loss_targets={fixed_validation_tokens:,}, "
             f"local_batches={val_batches_per_rank:,}, "
             f"manifest_sha256={fixed_val_dataset.manifest_sha256}"
         )
@@ -542,6 +582,7 @@ def main(job_config: JobConfig):
                 tokenizer=tokenizer,
                 context_len=job_config.training.context_len,
                 varlen=job_config.training.varlen,
+                loss_start_position=job_config.training.loss_start_position,
             ),
             num_workers=0,
         )
@@ -594,6 +635,7 @@ def main(job_config: JobConfig):
                 tokenizer=tokenizer,
                 context_len=job_config.training.context_len,
                 varlen=job_config.training.varlen,
+                loss_start_position=job_config.training.loss_start_position,
             ),
             num_workers=0,
         )
@@ -947,6 +989,17 @@ def main(job_config: JobConfig):
             "Validated Qwen3.8 parameters after checkpoint resolution: "
             f"{qwen38_loaded_audit}"
         )
+    # Repair the historical ordering bug where a resumable checkpoint could
+    # be published before its same-step model archive. A restart at that exact
+    # cadence boundary now fills the missing archive before doing more work.
+    if checkpoint_loaded and model_archive_is_due(
+        train_state.step, archive_every_steps
+    ):
+        save_model_only_archive(
+            checkpoint,
+            job_config.job.dump_folder,
+            train_state.step,
+        )
     # A legacy load temporarily omitted this missing key. All subsequent
     # checkpoints record the current topology.
     if checkpoint.enable_checkpoint:
@@ -966,11 +1019,28 @@ def main(job_config: JobConfig):
         lr_schedulers  # Pass schedulers if needed by logger logic
     )
 
-    # Log model configuration to WandB
+    # Record both the architecture and the exact objective/data recipe in WandB.
     metric_logger.log_config({
         "model/num_parameters": model_param_count,
         "model/num_flops_per_token": num_flops_per_token,
         "model/config": model_config.to_json_string() if hasattr(model_config, 'to_json_string') else str(model_config),
+        "training/seq_len": job_config.training.seq_len,
+        "training/steps": job_config.training.steps,
+        "training/loss_start_position": job_config.training.loss_start_position,
+        "training/loss_reduction": "global_unmasked_causal_target_mean",
+        "training/gradient_accumulation_steps": job_config.training.gradient_accumulation_steps,
+        "training/global_batch_size": (
+            job_config.training.batch_size
+            * dp_degree
+            * job_config.training.gradient_accumulation_steps
+        ),
+        "training/parent_blocks_per_step": job_config.training.parent_blocks_per_step,
+        "training/train_manifest_sha256": getattr(dataset, "manifest_sha256", None),
+        "validation/manifest_sha256": (
+            fixed_val_dataset.manifest_sha256 if fixed_validation else None
+        ),
+        "validation/num_loss_targets": fixed_validation_tokens,
+        "checkpoint/model_archive_every_steps": archive_every_steps,
         "sentinel/restored_generation": int(
             os.environ.get("SENTINEL_RESTORED_GENERATION", "-1")
         ),
@@ -1281,26 +1351,58 @@ def main(job_config: JobConfig):
 
             losses = []
             ga_steps = job_config.training.gradient_accumulation_steps
-            # do gradient accumulation if enabled
-            for ga_step in range(ga_steps):
-                # Skip redundant DDP/FSDP gradient synchronization on
-                # non-final micro-batches. The final micro-batch syncs the
-                # accumulated gradients. Pure FSDP has dp_replicate=1, so it
-                # must key off dp_shard_enabled as well.
-                if controls_gradient_sync(parallel_dims, ga_steps):
-                    model.set_requires_gradient_sync(ga_step == ga_steps - 1)
-
-                # get batch
+            batches = []
+            local_target_counts = []
+            for _ in range(ga_steps):
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
-                input_ids, labels = batch["input_ids"], batch["labels"]
-                attention_mask = batch.get("attention_mask")
+                batches.append(batch)
+                labels = batch["labels"]
+                local_target_counts.append(count_causal_lm_targets(labels))
 
-                # Update metrics processor state before forward/backward
+                # Update metrics processor state before forward/backward.
                 metric_logger.ntokens_since_last_log += labels.numel()
                 metric_logger.data_loading_times.append(
                     time.perf_counter() - data_load_start
                 )
+
+            local_target_count = sum(local_target_counts)
+            global_target_count = torch.tensor(
+                local_target_count, dtype=torch.int64, device=device
+            )
+            distributed_loss_average = (
+                parallel_dims.dp_replicate_enabled
+                or parallel_dims.dp_shard_enabled
+                or parallel_dims.cp_enabled
+            )
+            if distributed_loss_average:
+                loss_average_mesh = world_mesh["dp_cp"]
+                torch.distributed.all_reduce(
+                    global_target_count,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=loss_average_mesh.get_group(),
+                )
+                gradient_average_group_size = loss_average_mesh.size()
+            else:
+                gradient_average_group_size = 1
+            loss_scales = causal_lm_loss_scales(
+                local_target_counts,
+                global_target_count=int(global_target_count.item()),
+                gradient_average_group_size=gradient_average_group_size,
+            )
+
+            # do gradient accumulation if enabled
+            for ga_step, (batch, loss_scale) in enumerate(
+                zip(batches, loss_scales)
+            ):
+                # Skip redundant DDP/FSDP gradient communication on non-final
+                # micro-batches. FSDP2 accumulates in reduce_dtype and the final
+                # backward reduces the complete optimizer-step gradient.
+                if controls_gradient_sync(parallel_dims, ga_steps):
+                    model.set_requires_gradient_sync(ga_step == ga_steps - 1)
+
+                input_ids, labels = batch["input_ids"], batch["labels"]
+                attention_mask = batch.get("attention_mask")
 
                 input_ids = input_ids.to(device_type)
                 if attention_mask is not None:
@@ -1382,10 +1484,7 @@ def main(job_config: JobConfig):
                         if cu_seqlens is not None:
                             model_kwargs["cu_seqlens"] = cu_seqlens
                         output = model(**model_kwargs)
-                        loss = (
-                            output.loss
-                            / job_config.training.gradient_accumulation_steps
-                        )
+                        loss = output.loss * loss_scale
                         loss.backward()
 
                 losses.append(loss)
@@ -1415,11 +1514,7 @@ def main(job_config: JobConfig):
 
             # log metrics - Use MetricsProcessor
             if metric_logger.should_log(train_state.step):
-                if (
-                    parallel_dims.dp_replicate_enabled
-                    or parallel_dims.dp_shard_enabled
-                    or parallel_dims.cp_enabled
-                ):
+                if distributed_loss_average:
                     loss = loss.detach()
                     # Use dist_mean/max on the accumulated loss for the step
                     global_avg_loss, global_max_loss = (
@@ -1488,7 +1583,10 @@ def main(job_config: JobConfig):
             if (
                 not time_limit_triggered
                 and val_dataloader is not None
-                and train_state.step % val_interval == 0
+                and (
+                    train_state.step % val_interval == 0
+                    or train_state.step == _effective_max_steps
+                )
             ):
                 run_validation(train_state.step)
 
@@ -1500,54 +1598,22 @@ def main(job_config: JobConfig):
             ):
                 time_limit_triggered = True
 
+            # Model-only archive snapshot. Survives `keep_latest_k` purge so the
+            # full training trajectory (not just the last K steps) stays on
+            # disk. Archive cadence is independent of the resumable checkpoint
+            # interval. Save it first so a failure cannot advance the resume
+            # point past a missing historical snapshot.
+            if model_archive_is_due(train_state.step, archive_every_steps):
+                save_model_only_archive(
+                    checkpoint,
+                    job_config.job.dump_folder,
+                    train_state.step,
+                )
+
             checkpoint.save(
                 train_state.step,
                 force=(train_state.step == _effective_max_steps) or time_limit_triggered,
             )
-
-            # Model-only archive snapshot. Survives `keep_latest_k` purge so the
-            # full training trajectory (not just the last K steps) stays on
-            # disk. Archive cadence is set via env var FLAME_ARCHIVE_EVERY_STEPS
-            # (0 disables, default 5000). Saves model weights only in bfloat16
-            # to the `archive/step-N/` subdir of `job.dump_folder`. The main
-            # `checkpoint/` path continues to be the authoritative resume
-            # source — archive is read-only history for analysis.
-            _archive_every = int(os.environ.get("FLAME_ARCHIVE_EVERY_STEPS", "5000"))
-            _save_interval = job_config.checkpoint.interval
-            if (
-                _archive_every > 0
-                and train_state.step > 0
-                and (train_state.step % _archive_every == 0
-                     or train_state.step == _effective_max_steps)
-                and train_state.step % _save_interval == 0
-            ):
-                try:
-                    _archive_folder = os.path.join(
-                        job_config.job.dump_folder, "archive", f"step-{train_state.step}"
-                    )
-                    import torch.distributed.checkpoint as dcp
-                    from torchtitan.components.checkpoint import MODEL as _MODEL_KEY
-                    # Extract model state dict (FSDP-sharded DTensors under the
-                    # hood; dcp.save handles sharding). Cast floating-point
-                    # weights to bf16 to halve disk cost — archive is for
-                    # post-hoc analysis, not resume, so fp32 precision isn't
-                    # needed.
-                    _sd = checkpoint.states[_MODEL_KEY].state_dict()
-                    _sd.pop("freqs_cis", None)
-                    _sd = {
-                        k: (v.to(torch.bfloat16) if v.is_floating_point() else v)
-                        for k, v in _sd.items()
-                    }
-                    dcp.save(_sd, checkpoint_id=_archive_folder)
-                    if torch.distributed.get_rank() == 0:
-                        logger.info(
-                            f"Saved model-only bf16 archive at {_archive_folder}"
-                        )
-                except Exception as _e:
-                    if torch.distributed.get_rank() == 0:
-                        logger.warning(
-                            f"Archive save at step {train_state.step} failed: {_e}"
-                        )
 
             if time_limit_triggered:
                 if torch.distributed.get_rank() == 0:

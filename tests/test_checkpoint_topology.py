@@ -60,6 +60,13 @@ class CheckpointTopologyTest(unittest.TestCase):
         self.assertIsNone(getattr(args, "training.fixed_test_parent_blocks_dir"))
         self.assertIsNone(getattr(args, "training.fixed_val_parent_blocks_dir"))
         self.assertIsNone(getattr(args, "training.val_data_dir"))
+        self.assertEqual(getattr(args, "training.loss_start_position"), 0)
+
+    def test_loss_start_position_cli_is_zero_indexed(self) -> None:
+        args = JobConfig().parser.parse_args(
+            ["--training.loss_start_position", "8192"]
+        )
+        self.assertEqual(getattr(args, "training.loss_start_position"), 8192)
 
     def test_fixed_validation_plan_roundtrip_and_mismatch(self) -> None:
         plan = {

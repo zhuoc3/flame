@@ -327,6 +327,10 @@ class DataCollatorForLanguageModeling:
             (as determined by `cu_seqlens`) will be further chunked.
         varlen (`bool`):
             Whether to handle variable length concatenated sequences (`True`) or padded batches (`False`).
+        loss_start_position (`int`):
+            Zero-indexed token position at which loss begins. Labels before this
+            position are masked with -100. Because causal LM implementations shift
+            labels internally, the label at this exact position remains unmasked.
 
     Returns:
         A dictionary with the following keys:
@@ -341,8 +345,11 @@ class DataCollatorForLanguageModeling:
     tokenizer: PreTrainedTokenizer
     context_len: Optional[int] = None
     varlen: bool = False
+    loss_start_position: int = 0
 
     def __call__(self, examples: List[Union[List[int], Dict[str, Any]]]) -> Dict[str, Any]:
+        if self.loss_start_position < 0:
+            raise ValueError("loss_start_position must be non-negative")
         if not isinstance(examples[0], Dict):
             examples = [{'input_ids': example} for example in examples]
 
@@ -411,6 +418,7 @@ class DataCollatorForLanguageModeling:
             # Mask labels only where attention_mask is 0 (padding positions)
             if 'attention_mask' in batch:
                 labels[batch['attention_mask'] == 0] = -100
+            labels[..., : self.loss_start_position] = -100
             batch['labels'] = labels
 
         else:
@@ -520,6 +528,7 @@ class DataCollatorForLanguageModeling:
 
             # Create labels directly from input_ids, NO padding mask needed for varlen
             labels = batch['input_ids'].clone()
+            labels[..., : self.loss_start_position] = -100
             batch['labels'] = labels
 
         return batch
@@ -1088,6 +1097,7 @@ def build_dataloader(
     gradient_accumulation_steps: int = 1,
     seed: int = 42,
     parent_blocks_per_step: int = 32,
+    loss_start_position: int = 0,
 ):
     if isinstance(dataset, MemmapTokenBlockDataset):
         if dataset.valid_lengths_path is not None and varlen:
@@ -1119,7 +1129,10 @@ def build_dataloader(
             "dataset": virtual_dataset,
             "batch_size": batch_size,
             "collate_fn": DataCollatorForLanguageModeling(
-                tokenizer=tokenizer, context_len=context_len, varlen=varlen
+                tokenizer=tokenizer,
+                context_len=context_len,
+                varlen=varlen,
+                loss_start_position=loss_start_position,
             ),
             "num_workers": num_workers,
             "pin_memory": pin_memory,
@@ -1138,6 +1151,7 @@ def build_dataloader(
             "seed": seed,
             "context_len": context_len,
             "varlen": varlen,
+            "loss_start_position": loss_start_position,
         }
         return TopologyIndependentDataLoader(
             sampler=sampler, data_plan=data_plan, **loader_kwargs
@@ -1160,7 +1174,12 @@ def build_dataloader(
         rank=rank,
         dataset=dataset,
         batch_size=batch_size,
-        collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, context_len=context_len, varlen=varlen),
+        collate_fn=DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            context_len=context_len,
+            varlen=varlen,
+            loss_start_position=loss_start_position,
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
