@@ -19,6 +19,8 @@ sys.path.insert(0, str(_powerdata_dir))
 import fla  # noqa
 import powerformer_hf  # noqa - registers PowerFormer with Auto*
 import powerssm  # noqa - registers PowerSSM with Auto*
+if os.environ.get("HATTENTION_PATH"):
+    import hattention_register  # noqa - registers the pinned HAttention model
 import torch
 from datasets import interleave_datasets, load_dataset, load_from_disk
 from torch.distributed.device_mesh import init_device_mesh
@@ -671,6 +673,7 @@ def main(job_config: JobConfig):
     logger.info(f"Loading model config from {job_config.model.config}")
     model_config = AutoConfig.from_pretrained(job_config.model.config)
     is_qwen38 = model_config.model_type == "qwen3_5_text"
+    is_hattention = model_config.model_type == "hattention"
     if is_qwen38:
         model_config._attn_implementation = "sdpa"
     # set the model configs from training inputs:
@@ -976,6 +979,22 @@ def main(job_config: JobConfig):
                 )
 
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    if is_hattention:
+        if world_size > 1 and not checkpoint_loaded:
+            raise RuntimeError(
+                "Distributed HAttention must load a complete ordinary rank-1 "
+                "seed checkpoint or a resumable checkpoint before training"
+            )
+        from hattention_register import audit_hattention_parameters
+
+        hattention_loaded_audit = audit_hattention_parameters(
+            model,
+            require_initial_values=(resolved_load_step == 0),
+        )
+        logger.info(
+            "Validated HAttention parameters after checkpoint resolution: "
+            f"{hattention_loaded_audit}"
+        )
     if is_qwen38:
         from scripts.qwen38_runtime import audit_qwen38_deltanet_parameters
 
@@ -1041,6 +1060,13 @@ def main(job_config: JobConfig):
         ),
         "validation/num_loss_targets": fixed_validation_tokens,
         "checkpoint/model_archive_every_steps": archive_every_steps,
+        "source/root_commit": os.environ.get("SECOND_HALF_SOURCE_COMMIT"),
+        "source/identity_sha256": os.environ.get("SECOND_HALF_SOURCE_IDENTITY"),
+        "source/hattention_commit": os.environ.get("HATTENTION_COMMIT"),
+        "training/dataset_version": os.environ.get("SECOND_HALF_DATASET_VERSION"),
+        "training/data_parallel_replicate_degree": parallel_dims.dp_replicate,
+        "training/data_parallel_shard_degree": parallel_dims.dp_shard,
+        "training/local_batch_size": job_config.training.batch_size,
         "sentinel/restored_generation": int(
             os.environ.get("SENTINEL_RESTORED_GENERATION", "-1")
         ),
