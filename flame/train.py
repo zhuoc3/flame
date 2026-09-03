@@ -50,6 +50,7 @@ from flame.data import (
     FixedValidationSampler,
     Int64TokenBlockDatasetView,
     MemmapTokenBlockDataset,
+    RepositorySliceViewDataset,
     TopologyIndependentDataLoader,
     build_dataloader,
     shuffle,
@@ -245,11 +246,25 @@ def main(job_config: JobConfig):
     min_num_shards = dp_degree * job_config.training.num_workers
     if len(job_config.training.dataset.split(",")) == 1:
         deterministic_parent_blocks = job_config.training.dataset == "parent_blocks"
+        deterministic_repository_view = (
+            job_config.training.dataset == "repository_slices"
+        )
+        deterministic_token_dataset = (
+            deterministic_parent_blocks or deterministic_repository_view
+        )
         if deterministic_parent_blocks:
             dataset = MemmapTokenBlockDataset(job_config.training.data_dir)
             logger.info(
                 "Loaded deterministic parent-block store: "
                 f"rows={len(dataset):,}, seq_len={dataset.seq_len:,}, "
+                f"path={job_config.training.data_dir}"
+            )
+        elif deterministic_repository_view:
+            dataset = RepositorySliceViewDataset(job_config.training.data_dir)
+            logger.info(
+                "Loaded deterministic repository-slice view: "
+                f"rows={len(dataset):,}, seq_len={dataset.seq_len:,}, "
+                f"min_tail_tokens={dataset.min_tail_tokens:,}, "
                 f"path={job_config.training.data_dir}"
             )
         elif job_config.training.dataset == "disk":
@@ -273,10 +288,15 @@ def main(job_config: JobConfig):
             )
             logger.info(f"{dataset}")
 
-        logger.info(f"Shuffling the dataset with seed {job_config.training.seed}")
-        if deterministic_parent_blocks:
+        effective_data_seed = (
+            dataset.shuffle_seed
+            if deterministic_repository_view
+            else job_config.training.seed
+        )
+        logger.info(f"Shuffling the dataset with seed {effective_data_seed}")
+        if deterministic_token_dataset:
             logger.info(
-                "Parent-block shuffle is generated deterministically by global "
+                "Token-view shuffle is generated deterministically by global "
                 "optimizer step; skipping topology-dependent HF sharding"
             )
         elif not job_config.training.streaming:

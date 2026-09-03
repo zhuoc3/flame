@@ -290,7 +290,9 @@ class JobConfig:
             default=32,
             help=(
                 "For dataset=parent_blocks, exact number of shuffled fixed-length "
-                "parent blocks consumed by every optimizer step"
+                "parent blocks consumed by every optimizer step. For "
+                "dataset=repository_slices, this is the exact number of logical "
+                "slices consumed per optimizer step."
             ),
         )
         self.parser.add_argument(
@@ -325,7 +327,8 @@ class JobConfig:
             default="HuggingFaceFW/fineweb-edu",
             help=(
                 "Dataset to use, with comma separated values. Use 'parent_blocks' "
-                "for a deterministic uint16 16k token store."
+                "for a deterministic uint16 token store, or 'repository_slices' "
+                "for a compact logical view over repository token shards."
             ),
         )
         self.parser.add_argument(

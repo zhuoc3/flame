@@ -846,6 +846,212 @@ class Int64TokenBlockDatasetView(TorchDataset):
         return result
 
 
+_REPOSITORY_INDEX_DTYPE = np.dtype(
+    [
+        ("token_shard", "<u4"),
+        ("token_offset", "<u8"),
+        ("num_tokens", "<u8"),
+    ]
+)
+_REPOSITORY_VIEW_FORMAT = "stack-repository-logical-block-view"
+_REPOSITORY_VIEW_SHUFFLE = "splitmix64-feistel6-cyclewalk-v1"
+
+
+class RepositorySliceViewDataset(TorchDataset):
+    """Canonical logical blocks backed by immutable repository token shards."""
+
+    def __init__(self, root: Union[str, Path]):
+        self.root = Path(root).resolve()
+        manifest_path = self.root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Repository-view manifest not found: {manifest_path}")
+        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if self.manifest.get("format") != _REPOSITORY_VIEW_FORMAT:
+            raise ValueError(
+                f"Unsupported repository-view format: {self.manifest.get('format')!r}"
+            )
+        if int(self.manifest.get("format_version", -1)) != 1:
+            raise ValueError(
+                "Unsupported repository-view format version: "
+                f"{self.manifest.get('format_version')!r}"
+            )
+        self.seq_len = int(self.manifest["seq_len"])
+        self.num_rows = int(self.manifest["num_rows"])
+        self.min_tail_tokens = int(self.manifest["min_tail_tokens"])
+        self.pad_token_id = int(self.manifest["pad_token_id"])
+        if self.seq_len <= 1 or not 1 <= self.min_tail_tokens <= self.seq_len:
+            raise ValueError("Invalid repository-view sequence or tail length")
+        if not 0 <= self.pad_token_id <= np.iinfo(np.uint16).max:
+            raise ValueError("Repository-view pad token must fit uint16")
+
+        shuffle = self.manifest.get("shuffle", {})
+        if shuffle.get("algorithm") != _REPOSITORY_VIEW_SHUFFLE:
+            raise ValueError(
+                f"Unsupported repository-view shuffle: {shuffle.get('algorithm')!r}"
+            )
+        if shuffle.get("epoch_keyed") is not True:
+            raise ValueError("Repository-view shuffle must be epoch-keyed")
+        self.shuffle_seed = int(shuffle["seed"])
+        if not 0 <= self.shuffle_seed < 1 << 64:
+            raise ValueError("Repository-view shuffle seed must fit uint64")
+
+        self.source_root = (self.root / self.manifest["source"]["path"]).resolve()
+        source_manifest_path = self.source_root / "manifest.json"
+        source_manifest_bytes = source_manifest_path.read_bytes()
+        source_manifest_sha256 = hashlib.sha256(source_manifest_bytes).hexdigest()
+        if source_manifest_sha256 != self.manifest["source"]["manifest_sha256"]:
+            raise ValueError("Repository token-store manifest changed after view creation")
+        source_manifest = json.loads(source_manifest_bytes)
+        if source_manifest.get("fingerprint") != self.manifest["source"]["fingerprint"]:
+            raise ValueError("Repository token-store fingerprint does not match view")
+        self.num_repositories = int(source_manifest["num_repositories"])
+
+        repository_index_path = (
+            self.root / self.manifest["repository_index_file"]
+        ).resolve()
+        block_offsets_path = self.root / self.manifest["block_offsets_file"]
+        self._repositories = np.load(
+            repository_index_path, mmap_mode="r", allow_pickle=False
+        )
+        self._block_offsets = np.load(
+            block_offsets_path, mmap_mode="r", allow_pickle=False
+        )
+        if self._repositories.dtype != _REPOSITORY_INDEX_DTYPE or self._repositories.shape != (
+            self.num_repositories,
+        ):
+            raise ValueError("Repository-view physical index has the wrong layout")
+        if self._block_offsets.dtype != np.dtype("<u8") or self._block_offsets.shape != (
+            self.num_repositories + 1,
+        ):
+            raise ValueError("Repository-view block offsets have the wrong layout")
+        if int(self._block_offsets[0]) != 0 or int(self._block_offsets[-1]) != self.num_rows:
+            raise ValueError("Repository-view block offsets disagree with manifest")
+        if np.any(self._block_offsets[1:] < self._block_offsets[:-1]):
+            raise ValueError("Repository-view block offsets are not monotonic")
+        self.num_valid_tokens = int(self.manifest["num_valid_tokens"])
+        self._token_shards: Dict[int, np.memmap] = {}
+
+    @property
+    def column_names(self) -> List[str]:
+        return ["input_ids", "valid_length"]
+
+    def __len__(self) -> int:
+        return self.num_rows
+
+    def _shard(self, shard_index: int) -> np.memmap:
+        shard = self._token_shards.get(shard_index)
+        if shard is None:
+            path = self.source_root / "tokens" / f"part-{shard_index:05d}.bin"
+            shard = np.memmap(path, mode="r", dtype="<u2")
+            self._token_shards[shard_index] = shard
+        return shard
+
+    def block_location(self, index: int) -> tuple[int, int, int]:
+        if not 0 <= index < self.num_rows:
+            raise IndexError(f"logical block index {index} is outside [0, {self.num_rows})")
+        repo_ordinal = int(np.searchsorted(self._block_offsets, index, side="right") - 1)
+        block_in_repo = index - int(self._block_offsets[repo_ordinal])
+        repo_tokens = int(self._repositories["num_tokens"][repo_ordinal])
+        repo_token_start = block_in_repo * self.seq_len
+        valid_length = min(self.seq_len, repo_tokens - repo_token_start)
+        if valid_length <= 0 or (
+            valid_length < self.seq_len and valid_length < self.min_tail_tokens
+        ):
+            raise ValueError("Repository-view index resolves to an excluded block")
+        return repo_ordinal, repo_token_start, valid_length
+
+    def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
+        repo_ordinal, repo_token_start, valid_length = self.block_location(index)
+        shard_index = int(self._repositories["token_shard"][repo_ordinal])
+        shard_offset = int(self._repositories["token_offset"][repo_ordinal])
+        begin = shard_offset + repo_token_start
+        end = begin + valid_length
+        source = self._shard(shard_index)
+        if end > len(source):
+            raise ValueError(
+                f"Repository {repo_ordinal} block exceeds token shard {shard_index}"
+            )
+        if valid_length == self.seq_len:
+            tokens = source[begin:end]
+        else:
+            tokens = np.full(self.seq_len, self.pad_token_id, dtype=np.uint16)
+            tokens[:valid_length] = source[begin:end]
+        return {"input_ids": tokens, "valid_length": valid_length}
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_repositories"] = None
+        state["_block_offsets"] = None
+        state["_token_shards"] = {}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        repository_index_path = (
+            self.root / self.manifest["repository_index_file"]
+        ).resolve()
+        block_offsets_path = self.root / self.manifest["block_offsets_file"]
+        self._repositories = np.load(
+            repository_index_path, mmap_mode="r", allow_pickle=False
+        )
+        self._block_offsets = np.load(
+            block_offsets_path, mmap_mode="r", allow_pickle=False
+        )
+
+
+class DeterministicRepositorySliceDataset(TorchDataset):
+    """Epoch-shuffled logical repository slices addressed by optimizer step."""
+
+    def __init__(
+        self,
+        view_dataset: RepositorySliceViewDataset,
+        blocks_per_step: int,
+    ):
+        if blocks_per_step <= 0:
+            raise ValueError("blocks_per_step must be positive")
+        if len(view_dataset) < blocks_per_step:
+            raise ValueError(
+                f"Dataset has {len(view_dataset)} blocks but each step needs {blocks_per_step}"
+            )
+        self.view_dataset = view_dataset
+        self.samples_per_step = blocks_per_step
+        self.steps_per_epoch = len(view_dataset) // blocks_per_step
+
+    def __len__(self) -> int:
+        return self.steps_per_epoch * self.samples_per_step
+
+    def view_index(self, global_sample_index: int) -> tuple[int, int]:
+        if global_sample_index < 0:
+            raise IndexError("global sample indices must be non-negative")
+        optimizer_step, sample_in_step = divmod(
+            global_sample_index, self.samples_per_step
+        )
+        epoch, step_in_epoch = divmod(optimizer_step, self.steps_per_epoch)
+        position = step_in_epoch * self.samples_per_step + sample_in_step
+        return (
+            deterministic_permute(
+                position,
+                len(self.view_dataset),
+                self.view_dataset.shuffle_seed,
+                epoch,
+            ),
+            epoch,
+        )
+
+    def __getitem__(self, global_sample_index: int) -> Dict[str, torch.Tensor]:
+        view_index, _ = self.view_index(global_sample_index)
+        row = self.view_dataset[view_index]
+        tokens = np.array(row["input_ids"], dtype=np.int64, copy=True)
+        valid_length = int(row["valid_length"])
+        return {
+            "input_ids": torch.from_numpy(tokens),
+            "attention_mask": torch.arange(
+                len(tokens), dtype=torch.long
+            ).lt(valid_length).to(dtype=torch.long),
+        }
+
+
 class DeterministicParentBlockDataset(TorchDataset):
     """Virtual short-sequence view over shuffled fixed-length parent blocks.
 
@@ -1099,6 +1305,65 @@ def build_dataloader(
     parent_blocks_per_step: int = 32,
     loss_start_position: int = 0,
 ):
+    if isinstance(dataset, RepositorySliceViewDataset):
+        if seq_len != dataset.seq_len:
+            raise ValueError(
+                f"Repository view requires seq_len={dataset.seq_len}, got {seq_len}"
+            )
+        if varlen:
+            raise ValueError(
+                "Repository views require varlen=False so tail padding remains excluded from loss"
+            )
+        virtual_dataset = DeterministicRepositorySliceDataset(
+            view_dataset=dataset,
+            blocks_per_step=parent_blocks_per_step,
+        )
+        sampler = TopologyIndependentSampler(
+            rank=rank,
+            world_size=world_size,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            samples_per_step=virtual_dataset.samples_per_step,
+        )
+        logger.info(
+            "Using topology-independent repository-view loader: "
+            f"blocks/step={parent_blocks_per_step}, seq_len={dataset.seq_len}, "
+            f"rows={len(dataset)}, steps/epoch={virtual_dataset.steps_per_epoch}, "
+            f"shuffle_seed={dataset.shuffle_seed}"
+        )
+        loader_kwargs = {
+            "dataset": virtual_dataset,
+            "batch_size": batch_size,
+            "collate_fn": DataCollatorForLanguageModeling(
+                tokenizer=tokenizer,
+                context_len=context_len,
+                varlen=varlen,
+                loss_start_position=loss_start_position,
+            ),
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": persistent_workers,
+            "snapshot_every_n_steps": snapshot_every_n_steps,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+        data_plan = {
+            "schema_version": 1,
+            "dataset_format": _REPOSITORY_VIEW_FORMAT,
+            "manifest_sha256": dataset.manifest_sha256,
+            "view_fingerprint": dataset.manifest["fingerprint"],
+            "num_blocks": len(dataset),
+            "seq_len": seq_len,
+            "blocks_per_step": parent_blocks_per_step,
+            "shuffle": dataset.manifest["shuffle"],
+            "context_len": context_len,
+            "varlen": varlen,
+            "loss_start_position": loss_start_position,
+        }
+        return TopologyIndependentDataLoader(
+            sampler=sampler, data_plan=data_plan, **loader_kwargs
+        )
+
     if isinstance(dataset, MemmapTokenBlockDataset):
         if dataset.valid_lengths_path is not None and varlen:
             raise ValueError(

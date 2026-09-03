@@ -1,6 +1,7 @@
 import itertools
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,11 +13,14 @@ from torch.utils.data import Dataset
 from flame.data import (
     DataCollatorForLanguageModeling,
     DeterministicParentBlockDataset,
+    DeterministicRepositorySliceDataset,
     FixedValidationSampler,
     Int64TokenBlockDatasetView,
     MemmapTokenBlockDataset,
+    RepositorySliceViewDataset,
     TopologyIndependentDataLoader,
     TopologyIndependentSampler,
+    build_dataloader,
     deterministic_permute,
 )
 
@@ -80,6 +84,70 @@ def _rank_step_indices(
 
 
 class TopologyIndependentDataTest(unittest.TestCase):
+    def _repository_view(self, root: Path) -> RepositorySliceViewDataset:
+        source = root / "source"
+        tokens_dir = source / "tokens"
+        view = root / "view"
+        tokens_dir.mkdir(parents=True)
+        view.mkdir()
+        np.asarray(
+            [10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 30, 31, 32],
+            dtype="<u2",
+        ).tofile(tokens_dir / "part-00000.bin")
+        source_manifest = {
+            "format": "stack-repository-token-store",
+            "format_version": 1,
+            "fingerprint": "source-fingerprint",
+            "num_repositories": 3,
+            "total_tokens": 16,
+        }
+        source_manifest_path = source / "manifest.json"
+        source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+        repository_dtype = np.dtype(
+            [
+                ("token_shard", "<u4"),
+                ("token_offset", "<u8"),
+                ("num_tokens", "<u8"),
+            ]
+        )
+        repositories = np.zeros(3, dtype=repository_dtype)
+        repositories["token_offset"] = [0, 8, 13]
+        repositories["num_tokens"] = [8, 5, 3]
+        np.save(root / "repositories.npy", repositories, allow_pickle=False)
+        np.save(
+            view / "block_offsets.npy",
+            np.asarray([0, 2, 3, 4], dtype="<u8"),
+            allow_pickle=False,
+        )
+        manifest = {
+            "format": "stack-repository-logical-block-view",
+            "format_version": 1,
+            "fingerprint": "view-fingerprint",
+            "seq_len": 4,
+            "num_rows": 4,
+            "num_valid_tokens": 15,
+            "min_tail_tokens": 3,
+            "pad_token_id": 2,
+            "source": {
+                "path": os.path.relpath(source, view),
+                "manifest_sha256": hashlib.sha256(
+                    source_manifest_path.read_bytes()
+                ).hexdigest(),
+                "fingerprint": source_manifest["fingerprint"],
+            },
+            "repository_index_file": os.path.relpath(
+                root / "repositories.npy", view
+            ),
+            "block_offsets_file": "block_offsets.npy",
+            "shuffle": {
+                "algorithm": "splitmix64-feistel6-cyclewalk-v1",
+                "seed": 91,
+                "epoch_keyed": True,
+            },
+        }
+        (view / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return RepositorySliceViewDataset(view)
+
     def _virtual_dataset(self, seq_len: int, num_parents: int = 67):
         class _Parents(Dataset):
             def __len__(self):
@@ -104,6 +172,78 @@ class TopologyIndependentDataTest(unittest.TestCase):
                     for i in range(size)
                 ]
                 self.assertEqual(sorted(values), list(range(size)))
+
+    def test_repository_view_reads_full_and_retained_tail_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = self._repository_view(Path(temporary))
+            self.assertEqual(len(dataset), 4)
+            self.assertEqual(dataset.block_location(3), (2, 0, 3))
+            np.testing.assert_array_equal(dataset[0]["input_ids"], [10, 11, 12, 13])
+            np.testing.assert_array_equal(dataset[1]["input_ids"], [14, 15, 16, 17])
+            np.testing.assert_array_equal(dataset[2]["input_ids"], [20, 21, 22, 23])
+            np.testing.assert_array_equal(dataset[3]["input_ids"], [30, 31, 32, 2])
+            self.assertEqual(dataset[3]["valid_length"], 3)
+
+    def test_repository_view_order_is_epoch_keyed_and_topology_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = self._repository_view(Path(temporary))
+            virtual = DeterministicRepositorySliceDataset(dataset, blocks_per_step=2)
+            epoch_zero = [virtual.view_index(index)[0] for index in range(4)]
+            epoch_one = [virtual.view_index(index)[0] for index in range(4, 8)]
+            self.assertEqual(sorted(epoch_zero), list(range(4)))
+            self.assertEqual(sorted(epoch_one), list(range(4)))
+            self.assertNotEqual(epoch_zero, epoch_one)
+
+            expected = None
+            for world_size, accumulation in ((1, 2), (2, 1)):
+                indices = []
+                for rank in range(world_size):
+                    indices.extend(
+                        _rank_step_indices(
+                            rank=rank,
+                            world_size=world_size,
+                            batch_size=1,
+                            gradient_accumulation_steps=accumulation,
+                            samples_per_step=2,
+                            optimizer_step=1,
+                        )
+                    )
+                view_indices = sorted(virtual.view_index(index)[0] for index in indices)
+                if expected is None:
+                    expected = view_indices
+                self.assertEqual(view_indices, expected)
+
+    def test_repository_view_can_be_read_by_multiple_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = self._repository_view(Path(temporary))
+            virtual = DeterministicRepositorySliceDataset(dataset, blocks_per_step=2)
+            loader = torch.utils.data.DataLoader(virtual, batch_size=1, num_workers=2)
+            rows = list(loader)
+            self.assertEqual(len(rows), 4)
+            valid_lengths = [int(row["attention_mask"].sum().item()) for row in rows]
+            self.assertEqual(sorted(valid_lengths), [3, 4, 4, 4])
+
+    def test_repository_view_data_plan_survives_dp_shape_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = self._repository_view(Path(temporary))
+            common = {
+                "dataset": dataset,
+                "tokenizer": _IdentityTokenizer(),
+                "rank": 0,
+                "batch_size": 1,
+                "seq_len": 4,
+                "num_workers": 0,
+                "parent_blocks_per_step": 2,
+                "loss_start_position": 2,
+            }
+            dp1 = build_dataloader(
+                **common, world_size=1, gradient_accumulation_steps=2
+            )
+            dp2 = build_dataloader(
+                **common, world_size=2, gradient_accumulation_steps=1
+            )
+            self.assertEqual(dp1.data_plan, dp2.data_plan)
+            dp2.load_state_dict(dp1.state_dict())
 
     def test_epoch_rollover_is_step_aligned_and_deterministic(self):
         dataset = self._virtual_dataset(seq_len=PARENT_SEQ_LEN, num_parents=67)
