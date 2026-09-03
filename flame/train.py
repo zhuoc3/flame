@@ -1055,6 +1055,14 @@ def main(job_config: JobConfig):
             + (" after checkpoint load" if checkpoint_loaded else "")
         )
     metric_logger = build_metrics_processor(job_config, parallel_dims)
+    if os.environ.get("FLAME_REQUIRE_WANDB") == "1":
+        from flame.wandb_guard import require_online_wandb
+
+        wandb_audit = require_online_wandb(
+            metric_logger.logger,
+            save_for_all_ranks=job_config.metrics.save_for_all_ranks,
+        )
+        logger.info(f"Validated required online W&B logger: {wandb_audit}")
     # Set dependent attributes for metric_logger
     metric_logger.num_flops_per_token = num_flops_per_token
     metric_logger.optimizers = optimizers  # Pass optimizers if needed by logger logic
