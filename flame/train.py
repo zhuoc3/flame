@@ -54,6 +54,7 @@ from flame.data import (
     build_dataloader,
     shuffle,
 )
+from flame.distributed_control import synchronize_stop_request
 from flame.gradient_accumulation import controls_gradient_sync
 from flame.loss import (
     causal_lm_loss_scales,
@@ -714,9 +715,20 @@ def main(job_config: JobConfig):
             getattr(model_config, "fuse_cross_entropy", False)
             and FusedLinearCrossEntropyLoss is not None
         ):
-            model.criterion = FusedLinearCrossEntropyLoss(
-                num_chunks=8 // parallel_dims.tp
-            )
+            if is_hattention:
+                from scripts.hattention_runtime import (
+                    configure_hattention_criterion,
+                )
+
+                criterion_audit = configure_hattention_criterion(model)
+                logger.info(
+                    "Installed HAttention train/eval loss dispatch: "
+                    f"{criterion_audit}"
+                )
+            else:
+                model.criterion = FusedLinearCrossEntropyLoss(
+                    num_chunks=8 // parallel_dims.tp
+                )
         if is_qwen38:
             if job_config.training.varlen:
                 raise NotImplementedError(
@@ -995,6 +1007,18 @@ def main(job_config: JobConfig):
             "Validated HAttention parameters after checkpoint resolution: "
             f"{hattention_loaded_audit}"
         )
+        if checkpoint_loaded and resolved_load_step > 0:
+            from hattention_register import audit_hattention_optimizer_state
+
+            hattention_optimizer_audit = audit_hattention_optimizer_state(
+                model,
+                optimizers,
+                expected_step=resolved_load_step,
+            )
+            logger.info(
+                "Validated HAttention optimizer state after resume: "
+                f"{hattention_optimizer_audit}"
+            )
     if is_qwen38:
         from scripts.qwen38_runtime import audit_qwen38_deltanet_parameters
 
@@ -1168,9 +1192,18 @@ def main(job_config: JobConfig):
                     val_iterator = iter(val_dataloader)
                     current_val_iterator = val_iterator
                     batch = next(current_val_iterator)
-                input_ids = batch["input_ids"].to(device_type)
-                labels = batch["labels"].to(device_type)
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
                 attention_mask = batch.get("attention_mask")
+                if attention_mask is not None and is_hattention:
+                    from scripts.hattention_runtime import (
+                        omit_verified_right_tail_mask,
+                    )
+
+                    omit_verified_right_tail_mask(attention_mask, labels)
+                    attention_mask = None
+                input_ids = input_ids.to(device_type)
+                labels = labels.to(device_type)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device_type)
                 position_ids = (
@@ -1270,9 +1303,18 @@ def main(job_config: JobConfig):
                         "Fixed test iterator ended before every selected sequence "
                         "was evaluated"
                     ) from error
-                input_ids = batch["input_ids"].to(device_type)
-                labels = batch["labels"].to(device_type)
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
                 attention_mask = batch.get("attention_mask")
+                if attention_mask is not None and is_hattention:
+                    from scripts.hattention_runtime import (
+                        omit_verified_right_tail_mask,
+                    )
+
+                    omit_verified_right_tail_mask(attention_mask, labels)
+                    attention_mask = None
+                input_ids = input_ids.to(device_type)
+                labels = labels.to(device_type)
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(device_type)
                 position_ids = (
@@ -1429,6 +1471,14 @@ def main(job_config: JobConfig):
 
                 input_ids, labels = batch["input_ids"], batch["labels"]
                 attention_mask = batch.get("attention_mask")
+
+                if attention_mask is not None and is_hattention:
+                    from scripts.hattention_runtime import (
+                        omit_verified_right_tail_mask,
+                    )
+
+                    omit_verified_right_tail_mask(attention_mask, labels)
+                    attention_mask = None
 
                 input_ids = input_ids.to(device_type)
                 if attention_mask is not None:
@@ -1598,14 +1648,17 @@ def main(job_config: JobConfig):
             # Detect the time-limit window before starting validation. A full
             # validation pass can be long enough to consume the checkpoint
             # safety buffer by itself.
-            if (
-                slurm_end_time > 0
-                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
-            ):
-                time_limit_triggered = True
+            if slurm_end_time > 0:
+                local_time_limit_triggered = (
+                    time.time() > slurm_end_time - slurm_time_limit_buffer_s
+                )
+                time_limit_triggered = synchronize_stop_request(
+                    time_limit_triggered or local_time_limit_triggered
+                )
 
             # Periodic validation
             val_interval = getattr(job_config.training, "val_interval", 500)
+            validation_ran = False
             if (
                 not time_limit_triggered
                 and val_dataloader is not None
@@ -1615,14 +1668,20 @@ def main(job_config: JobConfig):
                 )
             ):
                 run_validation(train_state.step)
+                validation_ran = True
 
             # Detect SLURM time-limit window; force a save now if we're inside
             # the buffer, then break out so the remaining chain-mates take over.
-            if (
-                slurm_end_time > 0
-                and time.time() > slurm_end_time - slurm_time_limit_buffer_s
-            ):
-                time_limit_triggered = True
+            # This second collective is only needed after validation, the only
+            # operation between the first decision and checkpointing that may
+            # itself consume a substantial part of the safety buffer.
+            if slurm_end_time > 0 and validation_ran:
+                local_time_limit_triggered = (
+                    time.time() > slurm_end_time - slurm_time_limit_buffer_s
+                )
+                time_limit_triggered = synchronize_stop_request(
+                    time_limit_triggered or local_time_limit_triggered
+                )
 
             # Model-only archive snapshot. Survives `keep_latest_k` purge so the
             # full training trajectory (not just the last K steps) stays on
