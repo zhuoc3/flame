@@ -857,6 +857,23 @@ _REPOSITORY_VIEW_FORMAT = "stack-repository-logical-block-view"
 _REPOSITORY_VIEW_SHUFFLE = "splitmix64-feistel6-cyclewalk-v1"
 
 
+def _verify_file_sha256(path: Path, expected_sha256: Optional[str], label: str) -> None:
+    if not expected_sha256:
+        raise ValueError(f"Repository-view manifest has no {label} SHA256")
+    if not path.is_file():
+        raise FileNotFoundError(f"Repository-view {label} not found: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(8 << 20):
+            digest.update(block)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Repository-view {label} SHA256 mismatch: "
+            f"manifest={expected_sha256}, actual={actual_sha256}"
+        )
+
+
 class RepositorySliceViewDataset(TorchDataset):
     """Canonical logical blocks backed by immutable repository token shards."""
 
@@ -910,7 +927,17 @@ class RepositorySliceViewDataset(TorchDataset):
         repository_index_path = (
             self.root / self.manifest["repository_index_file"]
         ).resolve()
-        block_offsets_path = self.root / self.manifest["block_offsets_file"]
+        block_offsets_path = (self.root / self.manifest["block_offsets_file"]).resolve()
+        _verify_file_sha256(
+            repository_index_path,
+            self.manifest.get("repository_index_sha256"),
+            "repository index",
+        )
+        _verify_file_sha256(
+            block_offsets_path,
+            self.manifest.get("block_offsets_sha256"),
+            "block offsets",
+        )
         self._repositories = np.load(
             repository_index_path, mmap_mode="r", allow_pickle=False
         )
@@ -991,7 +1018,7 @@ class RepositorySliceViewDataset(TorchDataset):
         repository_index_path = (
             self.root / self.manifest["repository_index_file"]
         ).resolve()
-        block_offsets_path = self.root / self.manifest["block_offsets_file"]
+        block_offsets_path = (self.root / self.manifest["block_offsets_file"]).resolve()
         self._repositories = np.load(
             repository_index_path, mmap_mode="r", allow_pickle=False
         )

@@ -119,6 +119,12 @@ class TopologyIndependentDataTest(unittest.TestCase):
             np.asarray([0, 2, 3, 4], dtype="<u8"),
             allow_pickle=False,
         )
+        repository_index_sha256 = hashlib.sha256(
+            (root / "repositories.npy").read_bytes()
+        ).hexdigest()
+        block_offsets_sha256 = hashlib.sha256(
+            (view / "block_offsets.npy").read_bytes()
+        ).hexdigest()
         manifest = {
             "format": "stack-repository-logical-block-view",
             "format_version": 1,
@@ -138,7 +144,9 @@ class TopologyIndependentDataTest(unittest.TestCase):
             "repository_index_file": os.path.relpath(
                 root / "repositories.npy", view
             ),
+            "repository_index_sha256": repository_index_sha256,
             "block_offsets_file": "block_offsets.npy",
+            "block_offsets_sha256": block_offsets_sha256,
             "shuffle": {
                 "algorithm": "splitmix64-feistel6-cyclewalk-v1",
                 "seed": 91,
@@ -183,6 +191,57 @@ class TopologyIndependentDataTest(unittest.TestCase):
             np.testing.assert_array_equal(dataset[2]["input_ids"], [20, 21, 22, 23])
             np.testing.assert_array_equal(dataset[3]["input_ids"], [30, 31, 32, 2])
             self.assertEqual(dataset[3]["valid_length"], 3)
+
+    def test_repository_view_requires_index_checksums(self):
+        checksum_fields = (
+            "repository_index_sha256",
+            "block_offsets_sha256",
+        )
+        for checksum_field in checksum_fields:
+            with self.subTest(checksum_field=checksum_field):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    dataset = self._repository_view(root)
+                    manifest_path = dataset.root / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    del manifest[checksum_field]
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "has no .* SHA256"):
+                        RepositorySliceViewDataset(dataset.root)
+
+    def test_repository_view_rejects_index_checksum_mismatches(self):
+        checksum_fields = (
+            "repository_index_sha256",
+            "block_offsets_sha256",
+        )
+        for checksum_field in checksum_fields:
+            with self.subTest(checksum_field=checksum_field):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    dataset = self._repository_view(root)
+                    manifest_path = dataset.root / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest[checksum_field] = "0" * 64
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                        RepositorySliceViewDataset(dataset.root)
+
+    def test_repository_view_rejects_missing_index_files(self):
+        file_fields = (
+            "repository_index_file",
+            "block_offsets_file",
+        )
+        for file_field in file_fields:
+            with self.subTest(file_field=file_field):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    dataset = self._repository_view(root)
+                    index_path = (
+                        dataset.root / dataset.manifest[file_field]
+                    ).resolve()
+                    index_path.unlink()
+                    with self.assertRaisesRegex(FileNotFoundError, "not found"):
+                        RepositorySliceViewDataset(dataset.root)
 
     def test_repository_view_order_is_epoch_keyed_and_topology_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
