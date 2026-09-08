@@ -19,6 +19,7 @@ sys.path.insert(0, str(_powerdata_dir))
 import fla  # noqa
 import powerformer_hf  # noqa - registers PowerFormer with Auto*
 import powerssm  # noqa - registers PowerSSM with Auto*
+import powerdelta  # noqa - registers PowerDelta with Auto*
 if os.environ.get("HATTENTION_PATH"):
     import hattention_register  # noqa - registers the pinned HAttention model
 import torch
