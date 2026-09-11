@@ -73,6 +73,8 @@ from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.metrics import build_device_memory_monitor, build_metrics_processor, ensure_pp_loss_visible
 from torchtitan.components.optimizer import build_optimizers
+
+from flame.utils.optimizer import build_optimizers_honor_no_weight_decay
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
@@ -93,7 +95,7 @@ register_train_spec(
         config=AutoConfig,
         parallelize_fn=parallelize_fla,
         pipelining_fn=pipeline_fla,
-        build_optimizers_fn=build_optimizers,
+        build_optimizers_fn=build_optimizers_honor_no_weight_decay,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_dataloader,
         build_tokenizer_fn=build_tokenizer,
