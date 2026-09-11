@@ -17,6 +17,7 @@ import fla  # noqa
 import powerformer_hf  # noqa - registers PowerFormer with Auto*
 import powerssm  # noqa - registers PowerSSM with Auto*
 import powerdelta  # noqa - registers PowerDelta with Auto*
+import powergdn  # noqa - registers PowerGDN with Auto*
 from torchtitan.tools.logging import init_logger, logger
 
 
