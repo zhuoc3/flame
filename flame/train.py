@@ -17,10 +17,23 @@ _powerdata_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_powerdata_dir))
 
 import fla  # noqa
-import powerformer_hf  # noqa - registers PowerFormer with Auto*
-import powerssm  # noqa - registers PowerSSM with Auto*
-import powerdelta  # noqa - registers PowerDelta with Auto*
-import powergdn  # noqa - registers PowerGDN with Auto*
+# Model registrations: side-effect-only imports for the Auto* classes. A model
+# absent from this checkout must not take training down with it -- powergdn
+# lives on its own branch and is not present on powerdelta, and as a bare
+# import it crash-looped every member of a live sweep at seed time
+# (ModuleNotFoundError, 7 chained retries under --dependency=afterany).
+#
+# Nothing is masked that matters: a model actually being trained still fails
+# loudly a few lines later, when AutoConfig raises "unrecognized model type".
+# `logger` is not defined this early in the module, hence stderr.
+for _registration in ("powerformer_hf", "powerssm", "powerdelta", "powergdn"):
+    try:
+        __import__(_registration)
+    except ImportError as _exc:
+        print(
+            f"[flame] model registration skipped: {_registration} ({_exc})",
+            file=sys.stderr,
+        )
 if os.environ.get("HATTENTION_PATH"):
     import hattention_register  # noqa - registers the pinned HAttention model
 import torch
