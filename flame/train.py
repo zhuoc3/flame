@@ -938,6 +938,10 @@ def main(job_config: JobConfig):
         assert job_config.checkpoint.enable_checkpoint, (
             "Must enable checkpointing when creating a seed checkpoint"
         )
+        if model_config.model_type == "gated_deltanet":
+            from scripts.gdn_runtime import audit_gdn_parameters
+
+            logger.info(f"GDN seed audit: {audit_gdn_parameters(model, require_initial_values=True)}")
         checkpoint.save(curr_step=0, force=True)
         logger.info("Created seed checkpoint")
         return
@@ -1028,6 +1032,14 @@ def main(job_config: JobConfig):
                 )
 
     checkpoint_loaded = checkpoint.load(step=requested_load_step)
+    if model_config.model_type == "gated_deltanet":
+        from scripts.gdn_runtime import audit_gdn_parameters
+
+        gdn_audit = audit_gdn_parameters(
+            model,
+            require_initial_values=(not checkpoint_loaded or resolved_load_step == 0),
+        )
+        logger.info(f"GDN audit after checkpoint resolution: {gdn_audit}")
     if is_hattention:
         if world_size > 1 and not checkpoint_loaded:
             raise RuntimeError(
