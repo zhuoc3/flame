@@ -89,6 +89,15 @@ from torchtitan.components.metrics import build_device_memory_monitor, build_met
 from torchtitan.components.optimizer import build_optimizers
 
 from flame.utils.optimizer import build_optimizers_honor_no_weight_decay
+from flame.utils import checkpoint_compat
+
+# A parameter that never receives a gradient gets no optimizer state, so the
+# checkpoint that saved it and the fresh optimizer that loads it disagree on
+# how many keys exist. Without this, any run whose model has such a parameter
+# -- PowerDelta at DownUp depth K=1, i.e. seq_len 256/512/1024 -- cannot resume
+# at all. Missing model keys stay fatal; see the module docstring.
+checkpoint_compat.install()
+
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
