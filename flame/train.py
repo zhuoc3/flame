@@ -771,6 +771,17 @@ def main(job_config: JobConfig):
                     "Installed HAttention train/eval loss dispatch: "
                     f"{criterion_audit}"
                 )
+            elif (
+                model_config.model_type == "gated_deltanet"
+                and parallel_dims.tp == 1
+            ):
+                # fla's GatedDeltaNetForCausalLM reuses self.criterion on its
+                # eval logits path, where a fused *linear* loss has the wrong
+                # signature, so the first validation crashes. Left unset, it
+                # builds FusedLinearCrossEntropyLoss() for training (num_chunks
+                # 8, the same as 8 // tp here) and a logits-only loss for eval:
+                # the dispatch h_gated_deltanet has built in at c0fde27.
+                logger.info("gated_deltanet: using the model's own train/eval loss")
             else:
                 model.criterion = FusedLinearCrossEntropyLoss(
                     num_chunks=8 // parallel_dims.tp
@@ -848,6 +859,13 @@ def main(job_config: JobConfig):
         model.to_empty(device=init_device)
         with torch.no_grad():
             model.post_init()
+            if model_config.model_type == "gated_deltanet":
+                from flame.utils.gated_deltanet_init import init_gated_deltanet_decay
+
+                logger.info(
+                    "gated_deltanet: initialized A_log/dt_bias in "
+                    f"{init_gated_deltanet_decay(model)} layers"
+                )
             if is_qwen38:
                 from scripts.qwen38_runtime import audit_qwen38_deltanet_parameters
 
